@@ -4,6 +4,7 @@ import time
 import inspect
 import localization.detection
 import localization.apriltag_solution
+import localization.undistort
 import pipeline.ntables
 from time import monotonic_ns
 from typing import List, Dict, Optional, Set, Tuple
@@ -189,6 +190,16 @@ class CameraPipeline:
 
         self.focus_mode = False
         self.focus_score = 0.0
+        self._optical_health: Optional[Dict] = None
+        self._health_lock = Lock()
+        self._last_health_pub_at = 0.0
+        self._last_published_health_sig = None
+
+        cal_saved = localization.undistort.load_calibration(self.camera_id)
+        if isinstance(cal_saved, dict):
+            saved_diag = cal_saved.get("meta", {}).get("diagnostics")
+            if isinstance(saved_diag, dict):
+                self._optical_health = dict(saved_diag)
 
         self._writer: Optional[cv2.VideoWriter] = None
         self._recording_path: Optional[str] = None
@@ -279,6 +290,7 @@ class CameraPipeline:
             read_ns = monotonic_ns()
 
             if frame is None:
+                self._maybe_publish_health()
                 time.sleep(0.1)
                 return
 
@@ -333,6 +345,7 @@ class CameraPipeline:
             gain_frame = raw_gray if self.pipeline_type == "apriltag" else frame
             gain_corners = corners if (self.pipeline_type == "apriltag" and ids is not None) else None
             self.cam.update_auto_gain(gain_frame, gain_corners)
+            self._maybe_publish_health()
 
             now_m = time.monotonic()
             with self.lock:
@@ -470,6 +483,114 @@ class CameraPipeline:
                 self._overlay = localization.detection.ANNOTATE_TAGS(self.frame, *self._tags)
                 self._overlay_seq = self._frame_seq
             return self._overlay
+
+    def update_optical_health(self, report: Dict) -> None:
+        with self._health_lock:
+            self._optical_health = dict(report) if report else None
+        self._maybe_publish_health(force=True)
+
+    def get_health_report(self) -> Dict:
+        if not self.enabled:
+            return {
+                "status": "DISABLED",
+                "ok": True,
+                "summary": "Camera disabled",
+                "issues": [],
+                "metrics": {},
+            }
+
+        issues: List[Dict] = []
+        cam_open = self.cam.is_open() if hasattr(self.cam, "is_open") else False
+        last_at = self._last_processed_at
+        stale = last_at > 0.0 and (time.monotonic() - last_at) > 1.5
+        fail_count = int(getattr(self.cam, "fail_count", 0))
+        opened_attempted = bool(getattr(self.cam, "_opened", False))
+        if (opened_attempted and not cam_open) or fail_count > 0 or stale:
+            issues.append({
+                "code": "CAMERA_DISCONNECTED",
+                "severity": "ERROR",
+                "metric": "fail_count",
+                "value": fail_count,
+                "threshold": 0,
+                "message": "Camera stream offline or not receiving frames",
+                "recommendation": "Check USB cable, power, and camera port connection.",
+            })
+
+        res_w, res_h = self._frame_resolution
+        if not localization.undistort.has_opencv_calibration(self.camera_id, int(res_w), int(res_h)):
+            issues.append({
+                "code": "NO_CALIBRATION",
+                "severity": "WARNING",
+                "metric": "calibrated",
+                "value": 0,
+                "threshold": 1,
+                "message": f"No OpenCV calibration for {int(res_w)}x{int(res_h)}",
+                "recommendation": "Run ChArUco calibration on the Calibration tab.",
+            })
+
+        if bool(getattr(self.cam, "_gain_stuck", False)):
+            issues.append({
+                "code": "EXPOSURE_STUCK",
+                "severity": "WARNING",
+                "metric": "gain",
+                "value": float(getattr(self.cam, "_live_gain", -1)),
+                "threshold": 0,
+                "message": str(getattr(self.cam, "_exposure_status", "Auto gain cannot reach target")),
+                "recommendation": "Check exposure/gain limits or lighting.",
+            })
+
+        if cam_open and not self.focus_mode and last_at > 0.0 and self.frame_count >= 30:
+            fps = float(self.get_fps())
+            if 0.0 < fps < 60.0:
+                issues.append({
+                    "code": "LOW_FPS",
+                    "severity": "WARNING",
+                    "metric": "fps",
+                    "value": round(fps, 2),
+                    "threshold": 60.0,
+                    "message": f"Low stream rate ({fps:.1f} FPS < 60 FPS)",
+                    "recommendation": "Check exposure time, USB controller bandwidth, and CPU governors.",
+                })
+
+        metrics: Dict = {}
+        with self._health_lock:
+            opt = dict(self._optical_health) if self._optical_health else None
+        if opt is not None:
+            metrics = dict(opt.get("metrics") or {})
+            for issue in opt.get("issues") or []:
+                issues.append(dict(issue))
+
+        if any(i.get("severity") == "ERROR" for i in issues):
+            status = "ERROR"
+        elif any(i.get("severity") == "WARNING" for i in issues):
+            status = "WARNING"
+        else:
+            status = "OK"
+
+        summary = "Camera & optics OK" if not issues else "; ".join(i.get("message", "") for i in issues[:2])
+        return {
+            "status": status,
+            "ok": status == "OK",
+            "summary": summary,
+            "issues": issues,
+            "metrics": metrics,
+        }
+
+    def _maybe_publish_health(self, force: bool = False) -> None:
+        now_m = time.monotonic()
+        if not force and (now_m - self._last_health_pub_at) < 1.0:
+            return
+        self._last_health_pub_at = now_m
+        if not hasattr(self.ntables, "publish_health"):
+            return
+        report = self.get_health_report()
+        sig = (report["status"], tuple(i.get("code", "") for i in report["issues"]))
+        if force or sig != self._last_published_health_sig or (now_m - self._last_health_pub_at) >= 0.0:
+            self._last_published_health_sig = sig
+            try:
+                self.ntables.publish_health(report)
+            except Exception:
+                pass
 
     def get_frame_seq(self) -> int:
         return self._frame_seq

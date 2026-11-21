@@ -433,6 +433,10 @@ class CameraReader:
             "status": self._exposure_status,
         }
 
+    def is_open(self) -> bool:
+        with self._lock:
+            return self._opened and self._is_open_locked()
+
     def get_resolution(self) -> Tuple[int, int]:
         return self._width.valueInt(), self._height.valueInt()
 

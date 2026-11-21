@@ -11,7 +11,7 @@ from util.config import ConfigCategory
 from util.system_stats import get_system_stats
 from camera.camerareader import RESOLUTIONS
 from localization.undistort import has_opencv_calibration
-from calibration.checkerboard_calibrator import save_samples
+from calibration.charuco_calibrator import save_samples
 import os
 
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
@@ -109,8 +109,11 @@ class DashboardServer:
     @property
     def calibrator(self):
         if self._calibrator is None:
-            from calibration.checkerboard_calibrator import CheckerboardCalibrator
-            self._calibrator = CheckerboardCalibrator(self.camera_id)
+            from calibration.charuco_calibrator import CharucoCalibrator
+            pipeline = self.vision_manager.get_pipeline(self.camera_id)
+            res = pipeline.get_resolution() if pipeline is not None else (1280, 800)
+            cb = pipeline.update_optical_health if hasattr(pipeline, "update_optical_health") else None
+            self._calibrator = CharucoCalibrator(self.camera_id, resolution=res, on_health_update=cb)
         return self._calibrator
 
     def create_detection_content(self, cam_id):
@@ -1067,6 +1070,21 @@ class DashboardServer:
         self.server.add_url_rule(f'/calibration_feed/{cam_id}', f'calibration_feed_{cam_id}',
                                 lambda cid=cam_id: self.calibration_feed(cid))
 
+        @self.server.route('/api/calibration/health')
+        def api_calibration_health():
+            pipeline = self.vision_manager.get_pipeline(cam_id)
+            cal_status = self.calibrator.get_status()
+            health = (
+                pipeline.get_health_report()
+                if pipeline is not None and hasattr(pipeline, "get_health_report")
+                else cal_status.get("health", {})
+            )
+            return jsonify({
+                "camera_id": cam_id,
+                "health": health,
+                "calibration_status": cal_status,
+            })
+
     def setup_slider_callbacks(self):
         from dash import no_update
         from camera.preprocess import SET_DIVERGENCE_GAIN, SET_TARGET_BRIGHTNESS, SET_NUM_BINS, SET_MIN_CORR_STRENGTH
@@ -1283,7 +1301,32 @@ class DashboardServer:
             status = self.calibrator.get_status()
             progress_pct = status['progress'] * 100
             progress_color = '#00ff00' if status['is_calibrating'] else '#ffaa00'
-            
+            health = status.get('health') or {}
+            h_status = health.get('status', 'UNKNOWN')
+            h_color = '#00ff00' if h_status == 'OK' else ('#ffaa00' if h_status in ('WARNING', 'UNKNOWN', 'NO_BOARD') else '#ff5555')
+            h_metrics = health.get('metrics') or {}
+            h_issues = health.get('issues') or []
+
+            health_nodes = [
+                html.Div(
+                    f"Camera Health Self-Check: {h_status} - {health.get('summary', '')}",
+                    style={'margin': '8px 0 4px 0', 'color': h_color, 'font-weight': 'bold'},
+                )
+            ]
+            if h_metrics:
+                health_nodes.append(html.Div(
+                    f"Sharpness: {h_metrics.get('edge_sharpness', 0):.2f} | "
+                    f"Blur (Lap): {h_metrics.get('blur_score', 0):.0f} | "
+                    f"Contrast: {h_metrics.get('contrast', 0):.0f} | "
+                    f"Noise: {h_metrics.get('noise_sigma', 0):.1f}",
+                    style={'margin': '2px 0', 'font-size': '12px', 'color': '#CCC9CA'},
+                ))
+            for issue in h_issues[:2]:
+                health_nodes.append(html.Div(
+                    f"[{issue.get('severity')}] {issue.get('message')} -> {issue.get('recommendation')}",
+                    style={'margin': '2px 0', 'font-size': '12px', 'color': '#ff8888' if issue.get('severity') == 'ERROR' else '#ffd166'},
+                ))
+
             # Show progress bar during calibration
             progress_bar = None
             if status['is_calibrating']:
@@ -1315,6 +1358,7 @@ class DashboardServer:
                     ("Calibrating..." if status['is_calibrating'] else "Need more samples"),
                     style={'margin': '5px 0', 'color': progress_color}
                 ),
+                *health_nodes,
             ])
         
         @self.app.callback(
@@ -1330,6 +1374,16 @@ class DashboardServer:
             meta = result.get('meta', {})
             fov = meta.get('fov', {})
             distortion_viz = meta.get('distortion_viz_base64', '')
+            diag = meta.get('diagnostics') or {}
+            diag_status = diag.get('status', 'OK')
+            diag_color = '#00ff00' if diag_status == 'OK' else ('#ffaa00' if diag_status == 'WARNING' else '#ff5555')
+            diag_issues = [
+                html.Div(
+                    f"[{i.get('severity')}] {i.get('message')} -> {i.get('recommendation')}",
+                    style={'color': '#ff8888' if i.get('severity') == 'ERROR' else '#ffd166', 'margin': '4px 0', 'font-size': '13px'},
+                )
+                for i in (diag.get('issues') or [])
+            ]
             
             return [
                 html.H4("Calibration Results", style={
@@ -1339,7 +1393,7 @@ class DashboardServer:
                 }),
                 html.Div([
                     html.Div([
-                        html.H5("Field of View", style={'color': '#CCC9CA', 'margin': '10px 0'}),
+                        html.H5("Field of View & Optical Health", style={'color': '#CCC9CA', 'margin': '10px 0'}),
                         html.Div(f"Horizontal: {fov.get('horizontal', 0):.1f}°", 
                                 style={'color': '#CCC9CA', 'margin': '5px 0'}),
                         html.Div(f"Vertical: {fov.get('vertical', 0):.1f}°", 
@@ -1350,6 +1404,11 @@ class DashboardServer:
                                 style={'color': '#CCC9CA', 'margin': '15px 0 5px 0'}),
                         html.Div(f"Samples Used: {meta.get('num_samples', 0)}", 
                                 style={'color': '#CCC9CA', 'margin': '5px 0'}),
+                        html.Div(
+                            f"Optical Self-Check: {diag_status} - {diag.get('summary', '')}",
+                            style={'color': diag_color, 'margin': '10px 0 4px 0', 'font-weight': 'bold'},
+                        ),
+                        *diag_issues,
                     ], style={
                         'flex': '1',
                         'padding': '20px',
@@ -1675,6 +1734,11 @@ class CameraIndexServer:
                     if enabled and hasattr(pipeline, "get_detection_summary")
                     else []
                 )
+                health = (
+                    pipeline.get_health_report()
+                    if hasattr(pipeline, "get_health_report")
+                    else {"status": "OK", "ok": True, "summary": "", "issues": [], "metrics": {}}
+                )
                 cameras.append({
                     "id": cam_id,
                     "name": pipeline.get_camera_name(),
@@ -1692,6 +1756,7 @@ class CameraIndexServer:
                     "resolution": [int(resolution[0]), int(resolution[1])],
                     "detection_count": len(det_summary),
                     "detections": det_summary,
+                    "health": health,
                 })
             return jsonify({"cameras": cameras})
 
@@ -1760,6 +1825,7 @@ class CameraIndexServer:
                     <button type="button" data-action="record-stop" data-cam="{cam_id}">Stop Recording</button>
                   </div>
                   <p class="status" id="status-{cam_id}">Ready</p>
+                  <p class="health-line" id="health-{cam_id}">Health: Checking...</p>
                 </article>
                 """
             )
@@ -1869,6 +1935,16 @@ class CameraIndexServer:
       font-size: 13px;
       opacity: 0.9;
     }}
+    .health-line {{
+      margin: 0;
+      min-height: 1.2em;
+      font-size: 12px;
+      font-weight: 600;
+      opacity: 0.9;
+    }}
+    .health-ok {{ color: #7ae582; }}
+    .health-warn {{ color: #ffd166; }}
+    .health-err {{ color: #ff6b6b; }}
     .empty {{ opacity: 0.7; }}
   </style>
 </head>
@@ -1914,10 +1990,18 @@ class CameraIndexServer:
               }}
             }}
             const el = document.getElementById('status-' + cam.id);
-            if (!el) return;
-            const state = cam.recording ? 'Recording' : 'Idle';
-            const msg = cam.message || 'Ready';
-            el.textContent = state + ' · ' + msg;
+            if (el) {{
+              const state = cam.recording ? 'Recording' : 'Idle';
+              const msg = cam.message || 'Ready';
+              el.textContent = state + ' · ' + msg;
+            }}
+            const hEl = document.getElementById('health-' + cam.id);
+            if (hEl && cam.health) {{
+              const hs = cam.health.status || 'UNKNOWN';
+              const hsum = cam.health.summary || '';
+              hEl.textContent = 'Health: ' + hs + (hsum ? ' · ' + hsum : '');
+              hEl.className = 'health-line ' + (hs === 'ERROR' ? 'health-err' : (hs === 'WARNING' ? 'health-warn' : 'health-ok'));
+            }}
           }});
         }} catch (e) {{}}
       }}

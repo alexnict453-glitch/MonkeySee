@@ -52,11 +52,32 @@ def capture_stamp(capture_ns: int) -> Tuple[float, float]:
         return -1.0, age_s
     return (ntcore._now() + offset_us) / 1e6 - age_s, age_s
 
+class CameraHealthNTables:
+    """Publishes runtime and ChArUco optical self-diagnostics for one camera."""
+
+    def __init__(self, table):
+        self.health_ok_pub = table.getBooleanTopic("health_ok").publish(_PUB_OPTIONS)
+        self.health_status_pub = table.getStringTopic("health_status").publish(_PUB_OPTIONS)
+        self.health_issues_pub = table.getStringArrayTopic("health_issues").publish(_PUB_OPTIONS)
+        self.blur_score_pub = table.getDoubleTopic("blur_score").publish(_PUB_OPTIONS)
+
+    def publish_health(self, report: dict) -> None:
+        status = str(report.get("status", "UNKNOWN"))
+        issues = report.get("issues") or []
+        issue_strs = [f"{i.get('code', 'ISSUE')}: {i.get('message', '')}" for i in issues]
+        metrics = report.get("metrics") or {}
+        self.health_ok_pub.set(bool(report.get("ok", status == "OK")))
+        self.health_status_pub.set(status)
+        self.health_issues_pub.set(issue_strs)
+        self.blur_score_pub.set(float(metrics.get("blur_score", 0.0)))
+
+
 class AprilTagNTables:
     def __init__(self, camera_id: int):
         self.camera_id = camera_id
         inst = get_nt_instance()
         self.table = inst.getTable(f"AprilTagsCam{camera_id}")
+        self._health = CameraHealthNTables(self.table)
 
         self.latency_pub = self.table.getDoubleTopic("tl").publish(_PUB_OPTIONS)
         self.angles_pub = self.table.getDoubleArrayTopic("tx").publish(_PUB_OPTIONS)
@@ -65,6 +86,9 @@ class AprilTagNTables:
         self.frame_num_pub = self.table.getDoubleTopic("curFrameNum").publish(_PUB_OPTIONS)
         self.result_pub = self.table.getDoubleArrayTopic("result").publish(_PUB_OPTIONS)
         self.sync_rtt_pub = self.table.getDoubleTopic("sync_rtt_ms").publish(_PUB_OPTIONS)
+
+    def publish_health(self, report: dict) -> None:
+        self._health.publish_health(report)
 
     def execute(self, detections, latency, capture_ns):
         self.latency_pub.set(latency)
@@ -95,6 +119,7 @@ class GamePieceNTables:
         self.camera_id = camera_id
         inst = get_nt_instance()
         self.table = inst.getTable(f"GPDCam{camera_id}")
+        self._health = CameraHealthNTables(self.table)
 
         self.angles_pub = self.table.getDoubleArrayTopic("tx").publish(_PUB_OPTIONS)
         self.distances_pub = self.table.getDoubleArrayTopic("distances").publish(_PUB_OPTIONS)
@@ -104,6 +129,9 @@ class GamePieceNTables:
         self.optimal_target_pub = self.table.getDoubleArrayTopic("optimal_target").publish(_PUB_OPTIONS)
         # [capture_time_s, capture_latency_s, tx, distance, height, on_top, ...]
         self.result_pub = self.table.getDoubleArrayTopic("result").publish(_PUB_OPTIONS)
+
+    def publish_health(self, report: dict) -> None:
+        self._health.publish_health(report)
 
     def execute(self, detections, latency, capture_ns, optimal_solution: Optional[Tuple[float, float]] = None):
         angles: List[float] = []
