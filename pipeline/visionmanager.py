@@ -584,8 +584,12 @@ class CameraPipeline:
         if not hasattr(self.ntables, "publish_health"):
             return
         report = self.get_health_report()
-        sig = (report["status"], tuple(i.get("code", "") for i in report["issues"]))
-        if force or sig != self._last_published_health_sig or (now_m - self._last_health_pub_at) >= 0.0:
+        sig = (
+            report["status"],
+            tuple(i.get("code", "") for i in report["issues"]),
+            report.get("metrics", {}).get("blur_score"),
+        )
+        if force or sig != self._last_published_health_sig:
             self._last_published_health_sig = sig
             try:
                 self.ntables.publish_health(report)

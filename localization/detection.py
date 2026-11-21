@@ -11,7 +11,7 @@ from cv2.typing import MatLike
 
 import util.config as config_mod
 from localization.undistort import calibration_for, has_opencv_calibration
-from util.config import ConfigCategory, Config
+from util.config import ConfigCategory
 from util.logger import Logger
 
 logger = Logger("Detection")
@@ -32,6 +32,7 @@ DEFAULT_NAPA_LIB_PATH = "/usr/local/lib/libnapa_v061_a76_neon2_pgo.so"
 _FALLBACK_NAPA_LIB_PATH = "/home/orangepi/opi5plus_bench/napa_libs/libnapa_v061_a76_neon2_pgo.so"
 _NAPA_LENS_NONE = 0
 _NAPA_LENS_BROWN_CONRADY = 1
+# Reorder NAPA BL/BR/TR/TL corners to MonkeySee TR/TL/BL/BR corner order.
 _REORDER_FLAT = [4, 5, 6, 7, 0, 1, 2, 3]
 _DEFAULT_MAX_TAGS = 128
 
@@ -63,6 +64,7 @@ class _NapaDetection(ctypes.Structure):
     ]
 
 
+# Explicit struct dtype avoids NumPy's PEP3118 RuntimeWarning on ctypes packed structs.
 _NAPA_DET_DTYPE = np.dtype(
     {
         "names": ["id", "hamming", "decision_margin", "corners"],
@@ -75,6 +77,20 @@ _NAPA_DET_DTYPE = np.dtype(
         ],
         "itemsize": ctypes.sizeof(_NapaDetection),
     }
+)
+
+_DETECT_ARGTYPES = [
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    ctypes.POINTER(_NapaParams), ctypes.POINTER(_NapaDetection), ctypes.c_int,
+]
+
+_NAPA_BINDINGS = (
+    ("napa_create_family", [ctypes.c_char_p], ctypes.c_void_p, True),
+    ("napa_destroy", [ctypes.c_void_p], None, True),
+    ("napa_set_threads", [ctypes.c_void_p, ctypes.c_int], ctypes.c_int, True),
+    ("napa_set_lens", [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double), ctypes.c_int], ctypes.c_int, False),
+    ("napa_detect", _DETECT_ARGTYPES, ctypes.c_int, True),
+    ("napa_detect_shadows_configured", [*_DETECT_ARGTYPES, ctypes.c_int], ctypes.c_int, False),
 )
 
 
@@ -97,61 +113,26 @@ def _load_napa_c_library():
         with _napa_lib_lock:
             if _napa_lib_loaded:
                 return _napa_lib_handle
+        if platform.system() != "Linux":
+            with _napa_lib_lock:
+                _napa_lib_loaded, _napa_lib_handle = True, None
+            return None
 
-    if platform.system() != "Linux" and custom_path is None:
-        with _napa_lib_lock:
-            _napa_lib_loaded = True
-            _napa_lib_handle = None
-        return None
-
-    candidates = (
-        [custom_path]
-        if custom_path
-        else [DEFAULT_NAPA_LIB_PATH, _FALLBACK_NAPA_LIB_PATH, "libnapa_v061_a76_neon2_pgo.so"]
-    )
+    candidates = [custom_path] if custom_path else [DEFAULT_NAPA_LIB_PATH, _FALLBACK_NAPA_LIB_PATH, "libnapa_v061_a76_neon2_pgo.so"]
     loaded = None
     for path in candidates:
-        if not path:
-            continue
-        if os.path.isabs(path) and not os.path.exists(path):
+        if not path or (os.path.isabs(path) and not os.path.exists(path)):
             continue
         try:
             lib = ctypes.CDLL(path)
-            lib.napa_create_family.argtypes = [ctypes.c_char_p]
-            lib.napa_create_family.restype = ctypes.c_void_p
-            lib.napa_destroy.argtypes = [ctypes.c_void_p]
-            lib.napa_destroy.restype = None
-            lib.napa_set_threads.argtypes = [ctypes.c_void_p, ctypes.c_int]
-            lib.napa_set_threads.restype = ctypes.c_int
-            if hasattr(lib, "napa_set_lens"):
-                lib.napa_set_lens.argtypes = [
-                    ctypes.c_void_p,
-                    ctypes.c_int,
-                    ctypes.POINTER(ctypes.c_double),
-                    ctypes.POINTER(ctypes.c_double),
-                    ctypes.c_int,
-                ]
-                lib.napa_set_lens.restype = ctypes.c_int
-            lib.napa_detect.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.POINTER(_NapaParams),
-                ctypes.POINTER(_NapaDetection),
-                ctypes.c_int,
-            ]
-            lib.napa_detect.restype = ctypes.c_int
-            if hasattr(lib, "napa_detect_shadows_configured"):
-                lib.napa_detect_shadows_configured.argtypes = [*lib.napa_detect.argtypes, ctypes.c_int]
-                lib.napa_detect_shadows_configured.restype = ctypes.c_int
-            if hasattr(lib, "napa_set_regrow_small_tags"):
-                lib.napa_set_regrow_small_tags.argtypes = [ctypes.c_void_p, ctypes.c_int]
-                lib.napa_set_regrow_small_tags.restype = ctypes.c_int
-            if hasattr(lib, "napa_set_tag_shape"):
-                lib.napa_set_tag_shape.argtypes = [ctypes.c_void_p, ctypes.c_int]
-                lib.napa_set_tag_shape.restype = ctypes.c_int
+            for fn_name, argtypes, restype, required in _NAPA_BINDINGS:
+                fn = getattr(lib, fn_name, None)
+                if fn is None:
+                    if required:
+                        raise AttributeError(f"Missing required symbol {fn_name}")
+                    continue
+                fn.argtypes = argtypes
+                fn.restype = restype
             loaded = lib
             logger.Log(f"Loaded native NAPA C library: {path}")
             break
@@ -160,24 +141,19 @@ def _load_napa_c_library():
 
     if custom_path is None:
         with _napa_lib_lock:
-            _napa_lib_loaded = True
-            _napa_lib_handle = loaded
+            _napa_lib_loaded, _napa_lib_handle = True, loaded
     return loaded
 
 
 def _infer_camera_id(section: Optional[str]) -> Optional[int]:
-    if not section:
-        return None
-    match = re.search(r"(\d+)$", section)
+    match = re.search(r"(\d+)$", section) if section else None
     return int(match.group(1)) if match else None
 
 
 def _read_optional_config(section: Optional[str], keys: Tuple[str, ...], default, cast):
     """Read an optional config value from loaded_config without mutating config.json."""
     for cat in (section, "Detection"):
-        if not cat:
-            continue
-        sec_dict = config_mod.loaded_config.get(cat)
+        sec_dict = config_mod.loaded_config.get(cat) if cat else None
         if not isinstance(sec_dict, dict):
             continue
         for key in keys:
@@ -195,9 +171,7 @@ def _read_optional_config(section: Optional[str], keys: Tuple[str, ...], default
 
 def _sanitize_shadow_min_tag_px(shadow_min_tag_px: int, min_tag_px: int) -> int:
     px = int(shadow_min_tag_px)
-    if px <= 0:
-        return 0
-    return min(30000, max(int(min_tag_px), px))
+    return 0 if px <= 0 else min(30000, max(int(min_tag_px), px))
 
 
 def _as_bool(raw) -> bool:
@@ -210,12 +184,15 @@ def _as_bool(raw) -> bool:
     return bool(int(raw))
 
 
-def _resolve_napa_settings(section: Optional[str], default_min_tag_px: int = 0) -> dict:
-    min_tag_px = _read_optional_config(section, ("napa_min_tag_px",), default_min_tag_px, int)
+def _resolve_napa_settings(section: Optional[str], default_min_tag_px: int = 0, min_tag_px_override: Optional[int] = None) -> dict:
+    min_tag_px = (
+        int(min_tag_px_override)
+        if min_tag_px_override is not None
+        else _read_optional_config(section, ("napa_min_tag_px",), default_min_tag_px, int)
+    )
     threads = max(1, min(16, _read_optional_config(section, ("napa_threads",), 2, int)))
     recover_shadows = _read_optional_config(section, ("napa_recover_shadows", "recover_shadows"), True, _as_bool)
-    raw_shadow_px = _read_optional_config(section, ("napa_shadow_min_tag_px", "shadow_min_tag_px"), 64, int)
-    shadow_min_tag_px = _sanitize_shadow_min_tag_px(raw_shadow_px, max(1, min_tag_px))
+    raw_shadow_px = _read_optional_config(section, ("napa_shadow_min_tag_px", "shadow_min_tag_px"), 16, int)
     return {
         "min_tag_px": min_tag_px,
         "max_hamming": _read_optional_config(section, ("napa_max_hamming",), 2, int),
@@ -225,7 +202,7 @@ def _resolve_napa_settings(section: Optional[str], default_min_tag_px: int = 0) 
         "split_touching": _read_optional_config(section, ("napa_split_touching",), 0, int),
         "threads": threads,
         "recover_shadows": recover_shadows,
-        "shadow_min_tag_px": shadow_min_tag_px,
+        "shadow_min_tag_px": _sanitize_shadow_min_tag_px(raw_shadow_px, max(1, min_tag_px)),
         "apply_lens": bool(_read_optional_config(section, ("napa_apply_lens",), 1, int)),
     }
 
@@ -244,7 +221,7 @@ class NativeNapaDetector:
         split_touching: int = 0,
         threads: int = 2,
         recover_shadows: bool = True,
-        shadow_min_tag_px: int = 64,
+        shadow_min_tag_px: int = 16,
         camera_id: Optional[int] = None,
         apply_lens: bool = True,
         max_tags: int = _DEFAULT_MAX_TAGS,
@@ -277,6 +254,7 @@ class NativeNapaDetector:
             sharpening_x100=int(round(float(sharpening) * 100.0)),
             split_touching=int(split_touching),
         )
+        self._params_ref = ctypes.byref(self._params)
         self.threads = max(1, min(16, int(threads)))
         lib.napa_set_threads(self._det, self.threads)
 
@@ -284,49 +262,34 @@ class NativeNapaDetector:
         with self._lock:
             if camera_id != self._camera_id:
                 self._camera_id = camera_id
-                self._lens_size = None
-                self._lens_k_ref = None
-                self._lens_d_ref = None
+                self._lens_size = self._lens_k_ref = self._lens_d_ref = None
 
     def _sync_lens_locked(self, width: int, height: int) -> None:
         if not self._has_lens:
             return
-        if not self._apply_lens or self._camera_id is None:
-            if self._lens_size is not None or self._lens_k_ref is not None:
-                self._lib.napa_set_lens(self._det, _NAPA_LENS_NONE, None, None, 0)
-                self._lens_size = (width, height)
-                self._lens_k_ref = None
-                self._lens_d_ref = None
-            return
-
-        if has_opencv_calibration(self._camera_id, width, height):
+        cal = None
+        if self._apply_lens and self._camera_id is not None and has_opencv_calibration(self._camera_id, width, height):
             cal = calibration_for(self._camera_id, width, height)
-            if cal is not None:
-                cam_mat, dist_coeffs = cal
-                if (width, height) != self._lens_size or cam_mat is not self._lens_k_ref or dist_coeffs is not self._lens_d_ref:
-                    intrinsics = (ctypes.c_double * 5)(
-                        float(cam_mat[0, 0]),
-                        float(cam_mat[1, 1]),
-                        float(cam_mat[0, 2]),
-                        float(cam_mat[1, 2]),
-                        0.0,
-                    )
-                    dflat = np.asarray(dist_coeffs, dtype=np.float64).ravel()
-                    dist = (ctypes.c_double * 5)(*[float(dflat[i]) if i < dflat.size else 0.0 for i in range(5)])
-                    rc = self._lib.napa_set_lens(self._det, _NAPA_LENS_BROWN_CONRADY, intrinsics, dist, 5)
-                    if rc != 0:
-                        logger.Warn(f"Camera {self._camera_id}: napa_set_lens failed (rc={rc}), disabling lens model")
-                        self._lib.napa_set_lens(self._det, _NAPA_LENS_NONE, None, None, 0)
-                    self._lens_size = (width, height)
-                    self._lens_k_ref = cam_mat
-                    self._lens_d_ref = dist_coeffs
+
+        if cal is not None:
+            cam_mat, dist_coeffs = cal
+            if (width, height) == self._lens_size and cam_mat is self._lens_k_ref and dist_coeffs is self._lens_d_ref:
                 return
+            intrinsics = (ctypes.c_double * 5)(
+                float(cam_mat[0, 0]), float(cam_mat[1, 1]), float(cam_mat[0, 2]), float(cam_mat[1, 2]), 0.0,
+            )
+            dflat = np.asarray(dist_coeffs, dtype=np.float64).ravel()
+            dist = (ctypes.c_double * 5)(*[float(dflat[i]) if i < dflat.size else 0.0 for i in range(5)])
+            rc = self._lib.napa_set_lens(self._det, _NAPA_LENS_BROWN_CONRADY, intrinsics, dist, 5)
+            if rc != 0:
+                logger.Warn(f"Camera {self._camera_id}: napa_set_lens failed (rc={rc}), disabling lens model")
+                self._lib.napa_set_lens(self._det, _NAPA_LENS_NONE, None, None, 0)
+            self._lens_size, self._lens_k_ref, self._lens_d_ref = (width, height), cam_mat, dist_coeffs
+            return
 
         if (width, height) != self._lens_size or self._lens_k_ref is not None:
             self._lib.napa_set_lens(self._det, _NAPA_LENS_NONE, None, None, 0)
-            self._lens_size = (width, height)
-            self._lens_k_ref = None
-            self._lens_d_ref = None
+            self._lens_size, self._lens_k_ref, self._lens_d_ref = (width, height), None, None
 
     def _prepare_gray(self, image: MatLike) -> np.ndarray:
         if image.ndim == 3:
@@ -339,41 +302,14 @@ class NativeNapaDetector:
         h, w = gray.shape[:2]
         stride = int(gray.strides[0])
         self._sync_lens_locked(w, h)
+        args = (self._det, gray.ctypes.data, w, h, stride, self._params_ref, self._out_buf, self._max_tags)
         if self._recover_shadows:
-            cnt = self._lib.napa_detect_shadows_configured(
-                self._det,
-                gray.ctypes.data,
-                w,
-                h,
-                stride,
-                ctypes.byref(self._params),
-                self._out_buf,
-                self._max_tags,
-                self._shadow_min_tag_px,
-            )
+            cnt = self._lib.napa_detect_shadows_configured(*args, self._shadow_min_tag_px)
             if cnt < 0:
                 logger.Warn(f"napa_detect_shadows_configured returned {cnt}, retrying without shadow pass")
-                cnt = self._lib.napa_detect(
-                    self._det,
-                    gray.ctypes.data,
-                    w,
-                    h,
-                    stride,
-                    ctypes.byref(self._params),
-                    self._out_buf,
-                    self._max_tags,
-                )
+                cnt = self._lib.napa_detect(*args)
         else:
-            cnt = self._lib.napa_detect(
-                self._det,
-                gray.ctypes.data,
-                w,
-                h,
-                stride,
-                ctypes.byref(self._params),
-                self._out_buf,
-                self._max_tags,
-            )
+            cnt = self._lib.napa_detect(*args)
         if cnt < 0:
             logger.Warn(f"napa_detect failed with code {cnt}")
             return 0
@@ -392,9 +328,7 @@ class NativeNapaDetector:
                 return [], None
             sub = self._rows_view[:cnt]
             pts = sub["corners"][:, _REORDER_FLAT].reshape(cnt, 1, 4, 2)
-            corners = [pts[i] for i in range(cnt)]
-            ids = sub["id"].astype(np.int32, copy=True)
-            return corners, ids
+            return [pts[i] for i in range(cnt)], sub["id"].astype(np.int32, copy=True)
 
     def detect(self, image: MatLike):
         """Return list of tag objects matching napa_vision.NapaDetector.detect()."""
@@ -408,23 +342,19 @@ class NativeNapaDetector:
             if cnt <= 0:
                 return []
             sub = self._rows_view[:cnt]
-            tags = []
-            for i in range(cnt):
-                row = sub[i]
-                tags.append(
-                    _NativeTag(
-                        tag_id=int(row["id"]),
-                        hamming=int(row["hamming"]),
-                        decision_margin=float(row["decision_margin"]),
-                        corners=row["corners"].reshape(4, 2).copy(),
-                    )
+            return [
+                _NativeTag(
+                    tag_id=int(sub[i]["id"]),
+                    hamming=int(sub[i]["hamming"]),
+                    decision_margin=float(sub[i]["decision_margin"]),
+                    corners=sub[i]["corners"].reshape(4, 2).copy(),
                 )
-            return tags
+                for i in range(cnt)
+            ]
 
     def close(self) -> None:
         with self._lock:
-            det = getattr(self, "_det", None)
-            lib = getattr(self, "_lib", None)
+            det, lib = getattr(self, "_det", None), getattr(self, "_lib", None)
             self._det = None
             if det is not None and lib is not None:
                 try:
@@ -456,9 +386,7 @@ def SET_THRESH_WIN(value: int):
 
 
 dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
-
 parameters = cv2.aruco.DetectorParameters()
-
 parameters.adaptiveThreshWinSizeMin = min_thresh_win.valueInt()
 parameters.adaptiveThreshWinSizeMax = max_thresh_win.valueInt()
 parameters.adaptiveThreshWinSizeStep = thresh_step.valueInt()
@@ -476,10 +404,8 @@ def SET_CORNER_REFINE(value: int):
 
 
 def _refine_corners(corners, refine_image: MatLike):
-
     if refine_image is None or not corners:
         return corners
-
     if refine_image.ndim == 3:
         refine_image = cv2.cvtColor(refine_image, cv2.COLOR_BGR2GRAY)
 
@@ -493,42 +419,30 @@ def _refine_corners(corners, refine_image: MatLike):
     refined = []
     for quad in corners:
         pts = np.asarray(quad, dtype=np.float32).reshape(-1, 1, 2)
-
-        sides = [
-            float(np.linalg.norm(pts[i, 0] - pts[(i + 1) % 4, 0]))
-            for i in range(4)
-        ]
+        sides = [float(np.linalg.norm(pts[i, 0] - pts[(i + 1) % 4, 0])) for i in range(4)]
         win = int(min(base_win, max(2, min(sides) / 8.0)))
         if win < 2:
             refined.append(quad)
             continue
-
         try:
             out = cv2.cornerSubPix(refine_image, pts.copy(), (win, win), (-1, -1), criteria)
             refined.append(out.reshape(np.asarray(quad).shape))
         except cv2.error as e:
             logger.Warn(f"cornerSubPix failed, using unrefined corners: {e}")
             refined.append(quad)
-
     return refined
 
 
 def DETECT_TAGS(image: MatLike, refine_image: MatLike = None):
-    global _detector
     if _detector is not None:
         corners, IDs, _ = _detector.detectMarkers(image)
     else:
         corners, IDs, _ = cv2.aruco.detectMarkers(image, dictionary, parameters=parameters)
-
     if IDs is None:
         return corners, None
-
     if corner_refine.valueInt() > 0:
         corners = _refine_corners(corners, refine_image if refine_image is not None else image)
-
-    corners = [np.roll(q, 2, axis=1) for q in corners]
-
-    return corners, IDs.flatten()
+    return [np.roll(q, 2, axis=1) for q in corners], IDs.flatten()
 
 
 def _build_native_napa(section: Optional[str], camera_id: Optional[int], cfg: dict) -> Optional[NativeNapaDetector]:
@@ -574,22 +488,23 @@ def _build_python_napa(NapaDetector, cfg: dict):
         )
     except TypeError:
         try:
-            return NapaDetector(
-                **base_args,
-                split_touching=bool(cfg["split_touching"]),
-                recover_shadows=bool(cfg["recover_shadows"]),
-            )
+            return NapaDetector(**base_args, split_touching=bool(cfg["split_touching"]), recover_shadows=bool(cfg["recover_shadows"]))
         except TypeError:
             return NapaDetector(**base_args)
+
+
+def _format_py_napa_tags(tags):
+    if not tags:
+        return [], None
+    corners = [np.asarray(t.corners, dtype=np.float64)[[2, 3, 0, 1]].reshape(1, 4, 2) for t in tags]
+    return corners, np.array([t.tag_id for t in tags], dtype=np.int32)
 
 
 def MAKE_APRILTAG_DETECTOR(section: str, camera_id: Optional[int] = None) -> Optional[Callable]:
     settings = ConfigCategory(section)
     napa_min_tag_px = settings.getIntConfig("napa_min_tag_px", 0).valueInt()
     if napa_min_tag_px > 0:
-        cfg = _resolve_napa_settings(section, default_min_tag_px=napa_min_tag_px)
-        cfg["min_tag_px"] = napa_min_tag_px
-        cfg["shadow_min_tag_px"] = _sanitize_shadow_min_tag_px(cfg["shadow_min_tag_px"], napa_min_tag_px)
+        cfg = _resolve_napa_settings(section, min_tag_px_override=napa_min_tag_px)
         cam_id = camera_id if camera_id is not None else _infer_camera_id(section)
         native = _build_native_napa(section, cam_id, cfg)
         if native is not None:
@@ -599,7 +514,6 @@ def MAKE_APRILTAG_DETECTOR(section: str, camera_id: Optional[int] = None) -> Opt
                 f"shadow_min_tag_px={cfg['shadow_min_tag_px']}, camera_id={cam_id}"
             )
             return native.detect_raw
-
         try:
             from napa_vision import NapaDetector
         except ImportError:
@@ -635,22 +549,8 @@ def _get_cached_napa_detector(config_key: Optional[str], camera_id: Optional[int
     cam_id = camera_id if camera_id is not None else _infer_camera_id(section)
     cfg = _resolve_napa_settings(section, default_min_tag_px=16)
     if cfg["min_tag_px"] <= 0:
-        cfg["min_tag_px"] = 16
-        cfg["shadow_min_tag_px"] = _sanitize_shadow_min_tag_px(cfg["shadow_min_tag_px"], 16)
-    key = (
-        section,
-        cam_id,
-        cfg["min_tag_px"],
-        cfg["max_hamming"],
-        cfg["min_contrast"],
-        cfg["min_border_cells"],
-        cfg["sharpening"],
-        cfg["split_touching"],
-        cfg["threads"],
-        cfg["recover_shadows"],
-        cfg["shadow_min_tag_px"],
-        cfg["apply_lens"],
-    )
+        cfg = _resolve_napa_settings(section, min_tag_px_override=16)
+    key = (section, cam_id, *cfg.values())
     with _napa_cache_lock:
         det = _napa_cache.get(key)
         if det is not None:
@@ -677,22 +577,14 @@ def DETECT_NAPA(detector_or_image, image: Optional[MatLike] = None, config_key: 
         det, is_native = _get_cached_napa_detector(config_key, camera_id)
         if is_native:
             return det.detect_raw(detector_or_image)
-        tags = det.detect(detector_or_image)
-        if not tags:
-            return [], None
-        corners = [np.asarray(t.corners, dtype=np.float64)[[2, 3, 0, 1]].reshape(1, 4, 2) for t in tags]
-        return corners, np.array([t.tag_id for t in tags], dtype=np.int32)
+        return _format_py_napa_tags(det.detect(detector_or_image))
 
     detector = detector_or_image
     if camera_id is not None and hasattr(detector, "set_camera_id"):
         detector.set_camera_id(camera_id)
     if hasattr(detector, "detect_raw"):
         return detector.detect_raw(image)
-    tags = detector.detect(image)
-    if not tags:
-        return [], None
-    corners = [np.asarray(t.corners, dtype=np.float64)[[2, 3, 0, 1]].reshape(1, 4, 2) for t in tags]
-    return corners, np.array([t.tag_id for t in tags], dtype=np.int32)
+    return _format_py_napa_tags(detector.detect(image))
 
 
 def DETECT_APRILTAGS(detector, image: MatLike):

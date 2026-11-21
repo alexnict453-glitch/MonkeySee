@@ -1091,77 +1091,30 @@ class DashboardServer:
         from localization.detection import SET_THRESH_STEP, SET_THRESH_WIN
         from localization.visiony import CONF, ASPECT_THRESH
         from localization.gamepiece_solution import WD, ONT
-        
-        @self.app.callback(
-            Output({'type': 'dfc-target', 'index': MATCH}, 'value'),
-            [Input({'type': 'dfc-target', 'index': MATCH}, 'value')],
-            prevent_initial_call=True
-        )
-        def update_dfc_target(value):
-            if value is not None:
-                SET_TARGET_BRIGHTNESS(value)
-            return value
-        
-        @self.app.callback(
-            Output({'type': 'aslc-bins', 'index': MATCH}, 'value'),
-            [Input({'type': 'aslc-bins', 'index': MATCH}, 'value')],
-            prevent_initial_call=True
-        )
-        def update_aslc_bins(value):
-            if value is not None:
-                SET_NUM_BINS(value)
-            return value
-        
-        @self.app.callback(
-            Output({'type': 'aslc-min-corr', 'index': MATCH}, 'value'),
-            [Input({'type': 'aslc-min-corr', 'index': MATCH}, 'value')],
-            prevent_initial_call=True
-        )
-        def update_aslc_min_corr(value):
-            if value is not None:
-                SET_MIN_CORR_STRENGTH(value)
-            return value
-        
-        @self.app.callback(
-            Output({'type': 'divergence-gain', 'index': MATCH}, 'value'),
-            [Input({'type': 'divergence-gain', 'index': MATCH}, 'value')],
-            prevent_initial_call=True
-        )
-        def update_divergence_gain(value):
-            if value is not None:
-                SET_DIVERGENCE_GAIN(value)
-            return value
-        
-        @self.app.callback(
-            Output({'type': 'thresh-step', 'index': MATCH}, 'value'),
-            [Input({'type': 'thresh-step', 'index': MATCH}, 'value')],
-            prevent_initial_call=True
-        )
-        def update_thresh_step(value):
-            if value is not None:
-                SET_THRESH_STEP(value)
-            return value
-        
-        @self.app.callback(
-            Output({'type': 'max-thresh', 'index': MATCH}, 'value'),
-            [Input({'type': 'max-thresh', 'index': MATCH}, 'value')],
-            prevent_initial_call=True
-        )
-        def update_max_thresh(value):
-            if value is not None:
-                SET_THRESH_WIN(value)
-            return value
-        
-        @self.app.callback(
-            Output({'type': 'framecomp', 'index': MATCH}, 'value'),
-            [Input({'type': 'framecomp', 'index': MATCH}, 'value')],
-            prevent_initial_call=True
-        )
-        def update_framecomp(value):
-            if value is not None:
-                DashboardServer.framecomp_slider.setFloat(value)
-            return value
-        
+
+        for slider_type, setter in (
+            ("dfc-target", SET_TARGET_BRIGHTNESS),
+            ("aslc-bins", SET_NUM_BINS),
+            ("aslc-min-corr", SET_MIN_CORR_STRENGTH),
+            ("divergence-gain", SET_DIVERGENCE_GAIN),
+            ("thresh-step", SET_THRESH_STEP),
+            ("max-thresh", SET_THRESH_WIN),
+            ("framecomp", DashboardServer.framecomp_slider.setFloat),
+            ("yolo_conf", CONF.setFloat),
+            ("yolo_aspect", ASPECT_THRESH.setFloat),
+            ("wd", WD.setFloat),
+            ("ont", ONT.setFloat),
+        ):
+            @self.app.callback(
+                Output({"type": slider_type, "index": MATCH}, "value"),
+                [Input({"type": slider_type, "index": MATCH}, "value")],
+                prevent_initial_call=True,
+            )
+            def _update_slider(value, _setter=setter):
+                if value is not None:
+                    _setter(value)
+                return value
+
         @self.app.callback(
             [Output({'type': 'gain', 'index': MATCH}, 'disabled'),
              Output({'type': 'retune-gain', 'index': MATCH}, 'disabled'),
@@ -1201,46 +1154,6 @@ class DashboardServer:
             return self._resolution_status(self.camera_id, width, height)
 
         @self.app.callback(
-            Output({'type': 'yolo_conf', 'index': MATCH}, 'value'),
-            [Input({'type': 'yolo_conf', 'index': MATCH}, 'value')],
-            prevent_initial_call=True
-        )
-        def update_yolo_conf(value):
-            if value is not None:
-                CONF.setFloat(value)
-            return value
-        
-        @self.app.callback(
-            Output({'type': 'yolo_aspect', 'index': MATCH}, 'value'),
-            [Input({'type': 'yolo_aspect', 'index': MATCH}, 'value')],
-            prevent_initial_call=True
-        )
-        def update_yolo_aspect(value):
-            if value is not None:
-                ASPECT_THRESH.setFloat(value)
-            return value
-        
-        @self.app.callback(
-            Output({'type': 'wd', 'index': MATCH}, 'value'),
-            [Input({'type': 'wd', 'index': MATCH}, 'value')],
-            prevent_initial_call=True
-        )
-        def update_wd(value):
-            if value is not None:
-                WD.setFloat(value)
-            return value
-        
-        @self.app.callback(
-            Output({'type': 'ont', 'index': MATCH}, 'value'),
-            [Input({'type': 'ont', 'index': MATCH}, 'value')],
-            prevent_initial_call=True
-        )
-        def update_ont(value):
-            if value is not None:
-                ONT.setFloat(value)
-            return value
-        
-        @self.app.callback(
             Output({'type': 'reboot', 'index': MATCH}, 'n_clicks'),
             [Input({'type': 'reboot', 'index': MATCH}, 'n_clicks')],
             prevent_initial_call=True
@@ -1249,7 +1162,7 @@ class DashboardServer:
             if n_clicks:
                 os.system('sudo reboot')
             return n_clicks
-        
+
         @self.app.callback(
             Output({'type': 'reload', 'index': MATCH}, 'n_clicks'),
             [Input({'type': 'reload', 'index': MATCH}, 'n_clicks')],
@@ -1520,67 +1433,43 @@ class DashboardServer:
     def generate_calibration_frames(self, camera_id: int):
         blank_frame_cache = None
         last_frame = None
-        
+        yield MJPEG_PART_HEADER
+
         while True:
             pipeline = self.vision_manager.get_pipeline(camera_id)
-            
             if not pipeline:
                 if blank_frame_cache is None:
                     blank_frame_cache = _build_blank_jpeg("Camera Not Available", (180, 240), quality=60)
-                
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + blank_frame_cache + b'\r\n')
+                yield mjpeg_part(blank_frame_cache)
                 time.sleep(0.5)
                 continue
-            
+
             frame = pipeline.cam.get_raw_frame()
-            
-            if frame is None:
-                if last_frame is not None:
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n\r\n' + last_frame + b'\r\n')
-                time.sleep(0.05)
-                continue
-            
-            try:
-                annotated_frame, is_good_sample, status = self.calibrator.process_frame(frame, auto_capture=True)
-            except Exception as e:
-                import traceback
-                from util.logger import Logger
-                logger = Logger("DashboardServer")
-                logger.Error(f"Error processing calibration frame: {e}")
-                logger.Error(traceback.format_exc())
-                if last_frame is not None:
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n\r\n' + last_frame + b'\r\n')
-                time.sleep(0.05)
-                continue
-            
-            if self.calibrator.try_auto_capture():
-                cv2.rectangle(annotated_frame, (0, 0), (annotated_frame.shape[1], annotated_frame.shape[0]), 
-                             (0, 255, 0), 10)
-                cv2.putText(annotated_frame, "CAPTURED!", (annotated_frame.shape[1]//2 - 100, annotated_frame.shape[0]//2), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
-            
+            annotated_frame = None
+            if frame is not None:
+                try:
+                    annotated_frame, _, _ = self.calibrator.process_frame(frame, auto_capture=True)
+                except Exception as e:
+                    import traceback
+                    from util.logger import Logger
+                    log = Logger("DashboardServer")
+                    log.Error(f"Error processing calibration frame: {e}\n{traceback.format_exc()}")
+
             if annotated_frame is None:
                 if last_frame is not None:
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n\r\n' + last_frame + b'\r\n')
+                    yield mjpeg_part(last_frame)
                 time.sleep(0.05)
                 continue
-            
-            encode_params = [
-                cv2.IMWRITE_JPEG_QUALITY, 70,
-                cv2.IMWRITE_JPEG_OPTIMIZE, 1,
-            ]
-            
-            ret, buffer = cv2.imencode('.jpg', annotated_frame, encode_params)
-            frame_bytes = buffer.tobytes()
-            last_frame = frame_bytes
-            
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            
+
+            if self.calibrator.try_auto_capture():
+                cv2.rectangle(annotated_frame, (0, 0), (annotated_frame.shape[1], annotated_frame.shape[0]), (0, 255, 0), 10)
+                cv2.putText(annotated_frame, "CAPTURED!", (annotated_frame.shape[1] // 2 - 100, annotated_frame.shape[0] // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
+
+            ret, buffer = cv2.imencode('.jpg', annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 70, cv2.IMWRITE_JPEG_OPTIMIZE, 1])
+            if ret:
+                last_frame = buffer.tobytes()
+                yield mjpeg_part(last_frame)
             time.sleep(0.03)  # ~30 FPS
 
     def start_server(self):

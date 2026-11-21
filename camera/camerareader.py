@@ -63,6 +63,7 @@ class CameraReader:
     REOPEN_SLEEP_S = 0.5
     STALE_FRAME_S = 0.5
     MAX_FRAME_AGE_NS = 1_000_000_000
+    # BUFFERSIZE=2 avoids V4L2 UVC ring starvation (~68 FPS cap) at 120 FPS.
     DEFAULT_BUFFERSIZE = 2
 
     def __init__(

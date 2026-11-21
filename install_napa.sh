@@ -34,7 +34,7 @@ set -euo pipefail
 cd $TARGET_DIR
 grep -q MAKE_APRILTAG_DETECTOR localization/detection.py || { echo "This Pi has no NAPA code yet, run ./deploy.sh --go first"; exit 1; }
 venv/bin/python -m pip install --no-index /tmp/$WHEEL
-venv/bin/python -c "import numpy as np; from napa_vision import NapaDetector; NapaDetector(min_tag_px=$MIN_TAG_PX, max_hamming=2, min_contrast=12, sharpening=0.5, split_touching=False, recover_shadows=True, shadow_min_tag_px=64).detect(np.zeros((600, 800), np.uint8)); print('napa_vision works')"
+venv/bin/python -c "import numpy as np; from napa_vision import NapaDetector; NapaDetector(min_tag_px=$MIN_TAG_PX, max_hamming=2, min_contrast=12, sharpening=0.5, split_touching=False, recover_shadows=True, shadow_min_tag_px=16).detect(np.zeros((600, 800), np.uint8)); print('napa_vision works')"
 cp config.json config.json.before_napa_$STAMP
 venv/bin/python - <<'PY'
 import json
