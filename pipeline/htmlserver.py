@@ -1,8 +1,10 @@
+import logging
 import math
 from dash import Dash, html, dcc, Input, Output, State, ALL, MATCH, ctx
 import cv2
+import numpy as np
 from flask import Flask, Response, jsonify, request
-from pipeline.visionmanager import VisionManager
+from pipeline.visionmanager import VisionManager, pin_current_thread_little_cores
 import time
 from threading import Thread
 from util.config import ConfigCategory
@@ -11,6 +13,8 @@ from camera.camerareader import RESOLUTIONS
 from localization.undistort import has_opencv_calibration
 from calibration.checkerboard_calibrator import save_samples
 import os
+
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 
 DASHBOARD_BASE_PORT = 5800
@@ -32,6 +36,57 @@ MJPEG_PART_HEADER = b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
 
 def mjpeg_part(jpeg: bytes) -> bytes:
     return jpeg + b'\r\n' + MJPEG_PART_HEADER
+
+
+def _build_blank_jpeg(text: str, text_pos: tuple, quality: int = 60) -> bytes:
+    blank = 255 * np.ones((480, 640, 3), dtype="uint8")
+    cv2.putText(blank, text, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 1, (100, 100, 100), 2)
+    ok, buffer = cv2.imencode(".jpg", blank, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    return buffer.tobytes() if ok else b""
+
+
+def _stream_mjpeg_frames(vision_manager: VisionManager, camera_id: int, quality_fn, unavailable_text: str, text_pos: tuple):
+    blank_frame_cache = None
+    last_seq = None
+    next_send = 0.0
+    frame_interval = 1.0 / STREAM_MAX_FPS
+
+    yield MJPEG_PART_HEADER
+    while True:
+        pipeline = vision_manager.get_pipeline(camera_id)
+        if not pipeline or not pipeline.is_enabled():
+            if blank_frame_cache is None:
+                blank_frame_cache = _build_blank_jpeg(unavailable_text, text_pos, quality=60)
+            last_seq = None
+            yield mjpeg_part(blank_frame_cache)
+            time.sleep(0.5)
+            continue
+
+        wait_s = next_send - time.monotonic()
+        if wait_s > 0:
+            time.sleep(wait_s)
+
+        seq = pipeline.get_frame_seq() if hasattr(pipeline, "get_frame_seq") else None
+        if seq is not None and seq == last_seq:
+            time.sleep(0.01)
+            continue
+
+        quality = quality_fn()
+        source, jpeg = pipeline.get_preview_jpeg(quality, STREAM_MAX_WIDTH)
+        if source is None or jpeg is None:
+            time.sleep(0.01)
+            continue
+
+        if seq is None:
+            if source is last_seq:
+                time.sleep(0.01)
+                continue
+            last_seq = source
+        else:
+            last_seq = seq
+
+        next_send = time.monotonic() + frame_interval
+        yield mjpeg_part(jpeg)
 
 
 class DashboardServer:
@@ -888,18 +943,23 @@ class DashboardServer:
                 return self.create_detection_content(self.camera_id)
         
         cam_id = self.camera_id
-        
+
         @self.app.callback(
-            Output(f'metrics-{cam_id}', 'children'),
+            [
+                Output(f'metrics-{cam_id}', 'children'),
+                Output(f'system-{cam_id}', 'children'),
+                Output(f'detections-{cam_id}', 'children'),
+            ],
             [Input('update-interval', 'n_intervals')]
         )
-        def update_metrics(n_intervals, camera_id=cam_id):
+        def update_dashboard_panel(n_intervals, camera_id=cam_id):
             pipeline = self.vision_manager.get_pipeline(camera_id)
             if pipeline and pipeline.is_enabled():
                 backend_fps = pipeline.get_backend_fps()
-                fps_display = f"{backend_fps:.1f}" if backend_fps > 0 else f"{pipeline.get_framerate():.1f}"
-                return [
-                    html.Span(f"Processing: {fps_display} FPS", style={
+                fps_val = backend_fps if backend_fps > 0 else pipeline.get_framerate()
+                cap_ms = pipeline.get_capture_latency() * 1000 if hasattr(pipeline, "get_capture_latency") else 0.0
+                metrics_children = [
+                    html.Span(f"Processing: {fps_val:.1f} FPS", style={
                         "position": "absolute",
                         "left": "0",
                         "bottom": "0",
@@ -909,95 +969,96 @@ class DashboardServer:
                         "font-style": "italic",
                         "padding": "5px 10px",
                     }),
-                    html.Span(f"Latency: {pipeline.get_processing_latency() * 1000:.2f} ms", style={
-                        "position": "absolute",
-                        "right": "0",
-                        "bottom": "0",
-                        "color": "rgba(255, 255, 255, 0.8)",
-                        "font-size": "18px",
-                        "font-weight": "regular",
-                        "padding": "5px 10px",
-                        "font-style": "italic",
-                        "border-radius": "5px",
-                    })
+                    html.Span(
+                        f"Latency: {pipeline.get_processing_latency() * 1000:.2f} ms",
+                        title=f"Since capture: {cap_ms:.2f} ms",
+                        style={
+                            "position": "absolute",
+                            "right": "0",
+                            "bottom": "0",
+                            "color": "rgba(255, 255, 255, 0.8)",
+                            "font-size": "18px",
+                            "font-weight": "regular",
+                            "padding": "5px 10px",
+                            "font-style": "italic",
+                            "border-radius": "5px",
+                        },
+                    ),
                 ]
-            return [html.Span("Disabled", style={'color': '#888'})]
+            else:
+                metrics_children = [html.Span("Disabled", style={'color': '#888'})]
 
-        @self.app.callback(
-            Output(f'system-{cam_id}', 'children'),
-            [Input('update-interval', 'n_intervals')]
-        )
-        def update_system_stats(n_intervals):
             stats = get_system_stats()
             if stats is None:
-                return [html.Span("CPU stats need Linux", style={'color': '#888', 'padding': '5px 10px'})]
-            stat_style = {
-                "position": "absolute",
-                "bottom": "0",
-                "color": "rgba(255, 255, 255, 0.8)",
-                "font-size": "16px",
-                "font-style": "italic",
-                "padding": "5px 10px",
-            }
-            per_core = " · ".join(f"cpu{i} {p:.0f}%" for i, p in enumerate(stats["cores"]))
-            temp = stats["temp_c"]
-            return [
-                html.Span(f"CPU: {stats['cpu']:.0f}% (busiest core {max(stats['cores'], default=0):.0f}%)",
-                          title=per_core, style={**stat_style, "left": "0"}),
-                html.Span(f"CPU Temp: {temp:.1f} °C" if temp is not None else "CPU Temp: n/a",
-                          style={**stat_style, "right": "0"}),
-            ]
+                system_children = [html.Span("CPU stats need Linux", style={'color': '#888', 'padding': '5px 10px'})]
+            else:
+                stat_style = {
+                    "position": "absolute",
+                    "bottom": "0",
+                    "color": "rgba(255, 255, 255, 0.8)",
+                    "font-size": "16px",
+                    "font-style": "italic",
+                    "padding": "5px 10px",
+                }
+                per_core = " · ".join(f"cpu{i} {p:.0f}%" for i, p in enumerate(stats["cores"]))
+                temp = stats["temp_c"]
+                system_children = [
+                    html.Span(
+                        f"CPU: {stats['cpu']:.0f}% (busiest core {max(stats['cores'], default=0):.0f}%)",
+                        title=per_core,
+                        style={**stat_style, "left": "0"},
+                    ),
+                    html.Span(
+                        f"CPU Temp: {temp:.1f} °C" if temp is not None else "CPU Temp: n/a",
+                        style={**stat_style, "right": "0"},
+                    ),
+                ]
 
-        @self.app.callback(
-            Output(f'detections-{cam_id}', 'children'),
-            [Input('update-interval', 'n_intervals')]
-        )
-        def update_detections(n_intervals, camera_id=cam_id):
-            pipeline = self.vision_manager.get_pipeline(camera_id)
             if not pipeline or not pipeline.is_enabled():
-                return [html.Div("Camera disabled", style={'color': '#888'})]
-
-            detections = pipeline.get_detections()
-            if not detections:
-                return [html.Div("No detections", style={
-                    'color': '#CCC9CA',
-                    'font-size': '14px',
-                    'text-align': 'center',
-                    'border-radius': '10px',
-                    'border': '2px solid rgba(255, 255, 255, 0.5)',
-                    'padding': '10px',
-                    'margin': '0 0px 20px 20px',
-                })]
-            
-            detection_items = []
-            for i, det in enumerate(detections):
-                if pipeline.get_pipeline_type() == "apriltag":
-                    detection_items.append(html.Div([
-                        html.Span(f"Detection #{i + 1}:", style={'color': '#CCC9CA', 'margin-right': '10px', 'font-weight': 'medium'}),
-                        html.Span(f"Tag {det.getTag()}", style={'color': '#CCC9CA', 'margin-right': '5px'}),
-                        html.Span(f"R {det.getR():.1f}in", style={'color': '#CCC9CA', 'margin-right': '5px'}),
-                        html.Span(f"θ {det.getTheta():.2f}deg", style={'color': '#CCC9CA'}),
-                    ], style={
-                        'border': '2px solid rgba(255, 255, 255, 0.5)',
-                        'border-radius': '10px',
-                        'padding': '10px',
+                detection_items = [html.Div("Camera disabled", style={'color': '#888'})]
+            else:
+                detections = pipeline.get_detections()
+                if not detections:
+                    detection_items = [html.Div("No detections", style={
+                        'color': '#CCC9CA',
                         'font-size': '14px',
+                        'text-align': 'center',
+                        'border-radius': '10px',
+                        'border': '2px solid rgba(255, 255, 255, 0.5)',
+                        'padding': '10px',
                         'margin': '0 0px 20px 20px',
-                    }))
+                    })]
                 else:
-                    detection_items.append(html.Div([
-                        html.Span(f"Detection #{i + 1}:", style={'color': '#CCC9CA', 'margin-right': '10px', 'font-weight': 'medium'}),
-                        html.Span(f"R {det.getR():.2f}in", style={'color': '#CCC9CA', 'margin-right': '5px'}),
-                        html.Span(f"θ {det.getTheta():.2f}deg", style={'color': '#CCC9CA', 'margin-right': '10px'}),
-                        html.Span(f"On: {det.isOnTop()}", style={'color': '#CCC9CA'}),
-                    ], style={
-                        'border': '2px solid rgba(255, 255, 255, 0.5)',
-                        'border-radius': '10px',
-                        'padding': '10px',
-                        'font-size': '14px',
-                        'margin': '0 0px 20px 20px',
-                    }))
-            return detection_items
+                    detection_items = []
+                    for i, det in enumerate(detections):
+                        if pipeline.get_pipeline_type() == "apriltag":
+                            detection_items.append(html.Div([
+                                html.Span(f"Detection #{i + 1}:", style={'color': '#CCC9CA', 'margin-right': '10px', 'font-weight': 'medium'}),
+                                html.Span(f"Tag {det.getTag()}", style={'color': '#CCC9CA', 'margin-right': '5px'}),
+                                html.Span(f"R {det.getR():.1f}in", style={'color': '#CCC9CA', 'margin-right': '5px'}),
+                                html.Span(f"θ {det.getTheta():.2f}deg", style={'color': '#CCC9CA'}),
+                            ], style={
+                                'border': '2px solid rgba(255, 255, 255, 0.5)',
+                                'border-radius': '10px',
+                                'padding': '10px',
+                                'font-size': '14px',
+                                'margin': '0 0px 20px 20px',
+                            }))
+                        else:
+                            detection_items.append(html.Div([
+                                html.Span(f"Detection #{i + 1}:", style={'color': '#CCC9CA', 'margin-right': '10px', 'font-weight': 'medium'}),
+                                html.Span(f"R {det.getR():.2f}in", style={'color': '#CCC9CA', 'margin-right': '5px'}),
+                                html.Span(f"θ {det.getTheta():.2f}deg", style={'color': '#CCC9CA', 'margin-right': '10px'}),
+                                html.Span(f"On: {det.isOnTop()}", style={'color': '#CCC9CA'}),
+                            ], style={
+                                'border': '2px solid rgba(255, 255, 255, 0.5)',
+                                'border-radius': '10px',
+                                'padding': '10px',
+                                'font-size': '14px',
+                                'margin': '0 0px 20px 20px',
+                            }))
+
+            return metrics_children, system_children, detection_items
     
         self.setup_slider_callbacks()
         
@@ -1385,39 +1446,13 @@ class DashboardServer:
                        mimetype='multipart/x-mixed-replace; boundary=frame')
 
     def generate_frames(self, camera_id: int):
-        blank_frame_cache = None
-        last_source = None
-        next_send = 0.0
-
-        yield MJPEG_PART_HEADER
-        while True:
-            pipeline = self.vision_manager.get_pipeline(camera_id)
-            
-            if not pipeline or not pipeline.is_enabled():
-                if blank_frame_cache is None:
-                    blank = 255 * cv2.ones((480, 640, 3), dtype='uint8')
-                    cv2.putText(blank, "Camera Disabled", (200, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (100, 100, 100), 2)
-                    encode_params = [
-                        cv2.IMWRITE_JPEG_QUALITY, 60,
-                        cv2.IMWRITE_JPEG_OPTIMIZE, 1,
-                        cv2.IMWRITE_JPEG_PROGRESSIVE, 0
-                    ]
-                    ret, buffer = cv2.imencode('.jpg', blank, encode_params)
-                    blank_frame_cache = buffer.tobytes()
-
-                yield mjpeg_part(blank_frame_cache)
-                time.sleep(0.1)
-                continue
-
-            time.sleep(max(0.0, next_send - time.monotonic()))
-            quality = int(DashboardServer.framecomp_slider.valueFloat() * 100)
-            source, jpeg = pipeline.get_preview_jpeg(quality, STREAM_MAX_WIDTH)
-            if source is None or source is last_source:
-                time.sleep(0.01)
-                continue
-            last_source = source
-            next_send = time.monotonic() + 1.0 / STREAM_MAX_FPS
-            yield mjpeg_part(jpeg)
+        return _stream_mjpeg_frames(
+            self.vision_manager,
+            camera_id,
+            lambda: int(DashboardServer.framecomp_slider.valueFloat() * 100),
+            "Camera Disabled",
+            (200, 240),
+        )
 
     def calibration_feed(self, camera_id: int):
         return Response(self.generate_calibration_frames(camera_id),
@@ -1432,15 +1467,11 @@ class DashboardServer:
             
             if not pipeline:
                 if blank_frame_cache is None:
-                    blank = 255 * cv2.ones((480, 640, 3), dtype='uint8')
-                    cv2.putText(blank, "Camera Not Available", (180, 240), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 1, (100, 100, 100), 2)
-                    ret, buffer = cv2.imencode('.jpg', blank)
-                    blank_frame_cache = buffer.tobytes()
+                    blank_frame_cache = _build_blank_jpeg("Camera Not Available", (180, 240), quality=60)
                 
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + blank_frame_cache + b'\r\n')
-                time.sleep(0.1)
+                time.sleep(0.5)
                 continue
             
             frame = pipeline.cam.get_raw_frame()
@@ -1494,6 +1525,7 @@ class DashboardServer:
             time.sleep(0.03)  # ~30 FPS
 
     def start_server(self):
+        pin_current_thread_little_cores()
         port = dashboard_port(self.camera_id)
         print(f"\n{'='*50}")
         print(f"MonkeySee Dashboard Starting for Camera {self.camera_id}")
@@ -1605,6 +1637,7 @@ class CameraIndexServer:
         Thread(target=self.start_server, daemon=True).start()
 
     def start_server(self):
+        pin_current_thread_little_cores()
         print(f"\n{'='*50}")
         print("MonkeySee Camera Hub Starting")
         print(f"Port: {DASHBOARD_BASE_PORT}")
@@ -1622,15 +1655,43 @@ class CameraIndexServer:
             cameras = []
             for cam_id, pipeline in sorted(self.vision_manager.get_all_pipelines().items()):
                 status = pipeline.get_capture_status()
+                enabled = pipeline.is_enabled()
+                backend_fps = pipeline.get_backend_fps() if enabled else 0.0
+                framerate = pipeline.get_framerate() if enabled else 0.0
+                fps = pipeline.get_fps() if hasattr(pipeline, "get_fps") else (backend_fps if backend_fps > 0 else framerate)
+                proc_latency_ms = pipeline.get_processing_latency() * 1000.0 if enabled else 0.0
+                cap_latency_ms = (
+                    pipeline.get_capture_latency() * 1000.0
+                    if enabled and hasattr(pipeline, "get_capture_latency")
+                    else 0.0
+                )
+                resolution = (
+                    pipeline.get_resolution()
+                    if hasattr(pipeline, "get_resolution")
+                    else pipeline.cam.get_resolution()
+                )
+                det_summary = (
+                    pipeline.get_detection_summary()
+                    if enabled and hasattr(pipeline, "get_detection_summary")
+                    else []
+                )
                 cameras.append({
                     "id": cam_id,
                     "name": pipeline.get_camera_name(),
                     "pipeline": pipeline.get_pipeline_type(),
-                    "enabled": pipeline.is_enabled(),
+                    "enabled": enabled,
                     "dashboard_port": dashboard_port(cam_id),
                     "recording": status["recording"],
                     "message": status["message"],
                     "path": status["path"],
+                    "fps": round(fps, 2),
+                    "backend_fps": round(backend_fps, 2),
+                    "framerate": round(framerate, 2),
+                    "latency_ms": round(proc_latency_ms, 2),
+                    "capture_latency_ms": round(cap_latency_ms, 2),
+                    "resolution": [int(resolution[0]), int(resolution[1])],
+                    "detection_count": len(det_summary),
+                    "detections": det_summary,
                 })
             return jsonify({"cameras": cameras})
 
@@ -1669,38 +1730,13 @@ class CameraIndexServer:
             return jsonify({"ok": True, "message": message, **status})
 
     def _generate_frames(self, camera_id: int):
-        blank_frame_cache = None
-        last_source = None
-        next_send = 0.0
-        yield MJPEG_PART_HEADER
-        while True:
-            pipeline = self.vision_manager.get_pipeline(camera_id)
-            if not pipeline or not pipeline.is_enabled():
-                if blank_frame_cache is None:
-                    blank = 255 * cv2.ones((480, 640, 3), dtype="uint8")
-                    cv2.putText(
-                        blank,
-                        "Camera Unavailable",
-                        (140, 240),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1,
-                        (100, 100, 100),
-                        2,
-                    )
-                    ret, buffer = cv2.imencode(".jpg", blank, [cv2.IMWRITE_JPEG_QUALITY, 60])
-                    blank_frame_cache = buffer.tobytes()
-                yield mjpeg_part(blank_frame_cache)
-                time.sleep(0.1)
-                continue
-
-            time.sleep(max(0.0, next_send - time.monotonic()))
-            source, jpeg = pipeline.get_preview_jpeg(70, STREAM_MAX_WIDTH)
-            if source is None or source is last_source:
-                time.sleep(0.01)
-                continue
-            last_source = source
-            next_send = time.monotonic() + 1.0 / STREAM_MAX_FPS
-            yield mjpeg_part(jpeg)
+        return _stream_mjpeg_frames(
+            self.vision_manager,
+            camera_id,
+            lambda: 70,
+            "Camera Unavailable",
+            (140, 240),
+        )
 
     def _index_html(self):
         cards = []
@@ -1713,7 +1749,7 @@ class CameraIndexServer:
                   <div class="card-head">
                     <div>
                       <h2>{pipeline.get_camera_name()}</h2>
-                      <p class="meta">Camera {cam_id} · {pipeline.get_pipeline_type()} · {status}</p>
+                      <p class="meta" id="meta-{cam_id}">Camera {cam_id} · {pipeline.get_pipeline_type()} · {status}</p>
                     </div>
                     <a class="dash-link" href="http://HOST:{dashboard_port(cam_id)}/">Open dashboard</a>
                   </div>
@@ -1865,6 +1901,18 @@ class CameraIndexServer:
           const res = await fetch('/api/cameras');
           const data = await res.json();
           (data.cameras || []).forEach(function(cam) {{
+            const metaEl = document.getElementById('meta-' + cam.id);
+            if (metaEl) {{
+              if (cam.enabled) {{
+                const res = (cam.resolution && cam.resolution.length === 2) ? (cam.resolution[0] + 'x' + cam.resolution[1]) : '';
+                const fps = (typeof cam.fps === 'number') ? cam.fps.toFixed(1) + ' FPS' : '';
+                const lat = (typeof cam.latency_ms === 'number') ? cam.latency_ms.toFixed(1) + ' ms' : '';
+                const dets = (typeof cam.detection_count === 'number') ? cam.detection_count + ' det' : '';
+                metaEl.textContent = ['Camera ' + cam.id, cam.pipeline, 'Live', res, fps, lat, dets].filter(Boolean).join(' · ');
+              }} else {{
+                metaEl.textContent = 'Camera ' + cam.id + ' · ' + cam.pipeline + ' · Disabled';
+              }}
+            }}
             const el = document.getElementById('status-' + cam.id);
             if (!el) return;
             const state = cam.recording ? 'Recording' : 'Idle';

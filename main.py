@@ -1,5 +1,5 @@
 import pipeline.ntables
-from pipeline.visionmanager import VisionManager
+from pipeline.visionmanager import VisionManager, pin_current_thread_little_cores
 import argparse
 import platform
 
@@ -18,6 +18,7 @@ if __name__ == "__main__":
 
     print(f"Using config: {config_file}")
     vision_manager = VisionManager(config_file)
+    pin_current_thread_little_cores()
     import pipeline.htmlserver
     servers = []
     camera_ids = list(vision_manager.get_all_pipelines().keys())
@@ -31,4 +32,7 @@ if __name__ == "__main__":
     else:
         print("Camera 0 occupies port 5800; open each camera dashboard directly")
 
-    vision_manager.execute()
+    try:
+        vision_manager.execute()
+    except KeyboardInterrupt:
+        vision_manager.stop_all()

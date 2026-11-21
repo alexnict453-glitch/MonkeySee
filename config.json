@@ -266,6 +266,96 @@
             "type": 1
         }
     },
+    "Camera1": {
+        "auto_exposure": {
+            "value": "1",
+            "type": 1
+        },
+        "exposure": {
+            "value": "20",
+            "type": 1
+        },
+        "gain": {
+            "value": "50",
+            "type": 1
+        },
+        "width": {
+            "value": "1280",
+            "type": 1
+        },
+        "height": {
+            "value": "800",
+            "type": 1
+        },
+        "gain_target": {
+            "value": "100",
+            "type": 1
+        },
+        "tag_white_target": {
+            "value": "190",
+            "type": 1
+        }
+    },
+    "Camera2": {
+        "auto_exposure": {
+            "value": "1",
+            "type": 1
+        },
+        "exposure": {
+            "value": "20",
+            "type": 1
+        },
+        "gain": {
+            "value": "50",
+            "type": 1
+        },
+        "width": {
+            "value": "1280",
+            "type": 1
+        },
+        "height": {
+            "value": "800",
+            "type": 1
+        },
+        "gain_target": {
+            "value": "100",
+            "type": 1
+        },
+        "tag_white_target": {
+            "value": "190",
+            "type": 1
+        }
+    },
+    "Camera4": {
+        "auto_exposure": {
+            "value": "1",
+            "type": 1
+        },
+        "exposure": {
+            "value": "20",
+            "type": 1
+        },
+        "gain": {
+            "value": "50",
+            "type": 1
+        },
+        "width": {
+            "value": "1280",
+            "type": 1
+        },
+        "height": {
+            "value": "800",
+            "type": 1
+        },
+        "gain_target": {
+            "value": "100",
+            "type": 1
+        },
+        "tag_white_target": {
+            "value": "190",
+            "type": 1
+        }
+    },
     "Calibration": {
         "fix_principal_point": {
             "value": "0",

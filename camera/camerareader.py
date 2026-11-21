@@ -11,6 +11,11 @@ import os
 import shutil
 import subprocess
 
+try:
+    from localization.mpp_decode import MppMjpegDecoder
+except ImportError:
+    MppMjpegDecoder = None
+
 logger = Logger("Camera")
 
 # v4l2 auto_exposure menu values
@@ -54,10 +59,18 @@ class CameraReader:
     REOPEN_SLEEP_S = 0.5
     STALE_FRAME_S = 0.5
     MAX_FRAME_AGE_NS = 1_000_000_000
+    DEFAULT_BUFFERSIZE = 2
 
-    def __init__(self, camera_id: str, use_preprocessing: bool = False, settings_category: Optional[str] = None):
+    def __init__(
+        self,
+        camera_id: str,
+        use_preprocessing: bool = False,
+        settings_category: Optional[str] = None,
+        buffersize: int = DEFAULT_BUFFERSIZE,
+    ):
         self.camera_id = camera_id
         self.use_preprocessing = use_preprocessing
+        self._buffersize = max(1, int(buffersize))
 
         # exposure is in v4l2 units of 0.1 ms
         settings = ConfigCategory(settings_category or f"Camera_{camera_id}")
@@ -108,9 +121,39 @@ class CameraReader:
         self._last_frame: Optional[MatLike] = None
         self._last_frame_at = 0.0
         self.last_jpeg: Optional[MatLike] = None
+        self._mjpeg_decoder = None
+        self._init_mjpeg_decoder_locked()
+
+    def _init_mjpeg_decoder_locked(self) -> None:
+        if platform.system() != "Linux" or not self.use_preprocessing or MppMjpegDecoder is None:
+            return
+        if getattr(self, "_mjpeg_decoder", None) is not None:
+            return
+        try:
+            w, h = self.get_resolution()
+            self._mjpeg_decoder = MppMjpegDecoder(
+                max_w=max(1280, w),
+                max_h=max(800, h),
+                cachable=True,
+            )
+        except Exception as e:
+            logger.Warn(f"{self.camera_id}: MppMjpegDecoder unavailable, using cv2.imdecode: {e}")
+            self._mjpeg_decoder = None
+
+    def _decode_mjpeg_gray_locked(self, raw_frame: MatLike) -> Optional[MatLike]:
+        decoder = getattr(self, "_mjpeg_decoder", None)
+        if decoder is not None:
+            try:
+                decoded = decoder.decode_gray(raw_frame)
+                if decoded is not None:
+                    return decoded
+            except Exception as e:
+                logger.Warn(f"{self.camera_id}: MppMjpegDecoder decode failed, falling back to cv2.imdecode: {e}")
+        return cv2.imdecode(raw_frame, cv2.IMREAD_GRAYSCALE)
 
     def _open_camera_locked(self):
         logger.Log("Opening camera...")
+        self._init_mjpeg_decoder_locked()
 
         if self.cap:
             self.cap.release()
@@ -126,7 +169,7 @@ class CameraReader:
             return
 
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, getattr(self, "_buffersize", self.DEFAULT_BUFFERSIZE))
 
         if self.use_preprocessing:
             width, height = self.get_resolution()
@@ -151,7 +194,8 @@ class CameraReader:
             fourcc = int(self.cap.get(cv2.CAP_PROP_FOURCC))
             fourcc_str = "".join([chr((fourcc >> 8 * i) & 0xFF) for i in range(4)])
             backend = int(self.cap.get(cv2.CAP_PROP_BACKEND))
-            logger.Log(f"Camera opened successfully: {w}x{h} @ {fps:.1f}fps fourcc={fourcc_str} backend={backend}")
+            buf = int(self.cap.get(cv2.CAP_PROP_BUFFERSIZE))
+            logger.Log(f"Camera opened successfully: {w}x{h} @ {fps:.1f}fps fourcc={fourcc_str} buf={buf} backend={backend}")
         except Exception:
             logger.Log("Camera opened successfully")
 
@@ -346,7 +390,7 @@ class CameraReader:
             self.last_jpeg = None
             if ret and frame is not None and frame.ndim == 2 and min(frame.shape) == 1:
                 self.last_jpeg = frame
-                frame = cv2.imdecode(frame, cv2.IMREAD_GRAYSCALE)
+                frame = self._decode_mjpeg_gray_locked(frame)
 
             if ret and frame is not None:
                 self.fail_count = 0
@@ -392,6 +436,12 @@ class CameraReader:
             if self.cap:
                 self.cap.release()
                 self.cap = None
+            if getattr(self, "_mjpeg_decoder", None) is not None:
+                try:
+                    self._mjpeg_decoder.close()
+                except Exception:
+                    pass
+                self._mjpeg_decoder = None
             self._opened = False
             self._last_frame = None
 

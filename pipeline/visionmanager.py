@@ -1,23 +1,91 @@
 from camera.camerareader import CameraReader
 import cv2
 import time
+import inspect
 import localization.detection
 import localization.apriltag_solution
 import pipeline.ntables
 from time import monotonic_ns
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set, Tuple
 import platform
 import json
 import os
 import struct
 from datetime import datetime
-from threading import Thread, Lock
+from threading import Event, Thread, Lock
 from camera.preprocess import PROCESS_FRAME
 from util.logger import Logger
 
 logger = Logger("VisionManager")
 
 CAPTURES_DIR = "captures"
+
+
+def _detect_big_little_cpus() -> Tuple[Optional[Set[int]], Optional[Set[int]]]:
+    """Detect heterogeneous big/little CPU sets on Linux (e.g., RK3588 A76 vs A55)."""
+    if platform.system() != "Linux" or not hasattr(os, "sched_getaffinity"):
+        return None, None
+    try:
+        allowed = sorted(os.sched_getaffinity(0))
+    except OSError:
+        return None, None
+    if len(allowed) < 2:
+        return None, None
+
+    scores: Dict[int, int] = {}
+    for cpu in allowed:
+        val = None
+        for rel in ("cpu_capacity", "cpufreq/cpuinfo_max_freq", "cpufreq/scaling_max_freq"):
+            path = f"/sys/devices/system/cpu/cpu{cpu}/{rel}"
+            try:
+                with open(path, "r") as f:
+                    val = int(f.read().strip())
+                break
+            except (OSError, ValueError):
+                continue
+        if val is None:
+            return None, None
+        scores[cpu] = val
+
+    min_score = min(scores.values())
+    max_score = max(scores.values())
+    if max_score <= min_score:
+        return None, None
+
+    big = {cpu for cpu, score in scores.items() if score > min_score}
+    little = {cpu for cpu, score in scores.items() if score == min_score}
+    return (big or None), (little or None)
+
+
+_BIG_CPUS, _LITTLE_CPUS = _detect_big_little_cpus()
+
+
+def _pin_current_thread(cpus: Optional[Set[int]]) -> bool:
+    if not cpus or platform.system() != "Linux" or not hasattr(os, "sched_setaffinity"):
+        return False
+    try:
+        os.sched_setaffinity(0, cpus)
+        return True
+    except OSError:
+        return False
+
+
+def pin_current_thread_big_cores() -> bool:
+    """Pin calling Linux thread to high-performance cores (no-op elsewhere)."""
+    return _pin_current_thread(_BIG_CPUS)
+
+
+def pin_current_thread_little_cores() -> bool:
+    """Pin calling Linux thread to efficiency cores (no-op elsewhere)."""
+    return _pin_current_thread(_LITTLE_CPUS)
+
+
+def _supports_kwarg(fn, name: str) -> bool:
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def _open_writer(path: str, size, is_color: bool, raw: bool):
@@ -58,21 +126,32 @@ class CameraPipeline:
             self.cam = CameraReader(self.device_id, use_high_res, settings_category)
 
         self.frame_count = 0
-        self.start_time = time.time()
-        self.fps_log_time = time.time()
+        self._rate_count = 0
+        self.start_time = time.monotonic()
+        self.fps_log_time = self.start_time
         self.fps_log_count = 0
-        self.framerate = 30.0
+        self.framerate = 0.0
         self.backend_fps = 0.0
         self.processing_latency = 0.0
+        self.capture_latency = 0.0
+        self._last_processed_at = 0.0
+        self._frame_resolution: Tuple[int, int] = self.cam.get_resolution()
         self.frame: cv2.typing.MatLike = None
         self._tags = None
-        self._overlay_src = None
+        self._frame_seq = 0
+        self._overlay_seq = -1
         self._overlay = None
-        self._preview = (None, 0, b"")
+        self._preview_lock = Lock()
+        self._preview_seq = -1
+        self._preview_frame = None
+        self._preview_cache: Dict[Tuple[int, int], bytes] = {}
         self.detections: List = []
         self.frame_num = 0
         self.lock = Lock()
         self.running = True
+        self._enabled_event = Event()
+        if self.enabled:
+            self._enabled_event.set()
 
         self.focus_mode = False
         self.focus_score = 0.0
@@ -85,7 +164,29 @@ class CameraPipeline:
         if self.pipeline_type == "apriltag":
             apriltag_section = camera_config.get("apriltag_config", f"AprilTag{self.camera_id}")
             localization.apriltag_solution.SET_CAM(self.camera_id, apriltag_section)
-            self._apriltag = localization.detection.MAKE_APRILTAG_DETECTOR(apriltag_section)
+            prev_cpus = None
+            if _BIG_CPUS and platform.system() == "Linux" and hasattr(os, "sched_getaffinity"):
+                try:
+                    prev_cpus = os.sched_getaffinity(0)
+                    os.sched_setaffinity(0, _BIG_CPUS)
+                except OSError:
+                    prev_cpus = None
+            try:
+                if _supports_kwarg(localization.detection.MAKE_APRILTAG_DETECTOR, "camera_id"):
+                    self._apriltag = localization.detection.MAKE_APRILTAG_DETECTOR(
+                        apriltag_section, camera_id=self.camera_id
+                    )
+                else:
+                    self._apriltag = localization.detection.MAKE_APRILTAG_DETECTOR(apriltag_section)
+            finally:
+                if prev_cpus is not None:
+                    try:
+                        os.sched_setaffinity(0, prev_cpus)
+                    except OSError:
+                        pass
+            self._apriltag_accepts_cam_id = (
+                self._apriltag is not None and _supports_kwarg(self._apriltag, "camera_id")
+            )
             self.ntables = pipeline.ntables.AprilTagNTables(self.camera_id)
         else:
             from localization import gamepiece_solution
@@ -94,10 +195,14 @@ class CameraPipeline:
             self.ntables = pipeline.ntables.GamePieceNTables(self.camera_id)
             self._visiony = visiony
             self._gamepiece_solution = gamepiece_solution
+            self._apriltag = None
+            self._apriltag_accepts_cam_id = False
 
     def process_frame(self):
-        if not self.enabled or not self.running:
-            time.sleep(0.05)
+        if not self.running:
+            return
+        if not self.enabled:
+            self._enabled_event.wait(0.25)
             return
 
         try:
@@ -111,6 +216,7 @@ class CameraPipeline:
                 time.sleep(0.1)
                 return
 
+            frame_res = (int(frame.shape[1]), int(frame.shape[0]))
             self.frame_num += 1
             self.frame_num %= 500
 
@@ -124,6 +230,8 @@ class CameraPipeline:
                     self.focus_score = focus_score
                     self.frame = frame
                     self._tags = None
+                    self._frame_seq += 1
+                    self._frame_resolution = frame_res
                 time.sleep(0.03)
                 return
 
@@ -132,7 +240,10 @@ class CameraPipeline:
                 raw_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
                 if self._apriltag is not None:
                     frame = raw_gray
-                    corners, ids = self._apriltag(raw_gray)
+                    if self._apriltag_accepts_cam_id:
+                        corners, ids = self._apriltag(raw_gray, camera_id=self.camera_id)
+                    else:
+                        corners, ids = self._apriltag(raw_gray)
                 else:
                     frame = PROCESS_FRAME(raw_gray)
                     corners, ids = localization.detection.DETECT_TAGS(frame, refine_image=raw_gray)
@@ -155,6 +266,7 @@ class CameraPipeline:
                 self.ntables.updateFrameNum(self.frame_num)
             self.ntables.execute(detections, processing_latency, capture_ns)
 
+            now_m = time.monotonic()
             with self.lock:
                 if self._recording_pending and self._writer is None:
                     self._start_writer_locked(cam_frame, jpeg is not None)
@@ -165,23 +277,34 @@ class CameraPipeline:
                         self._record_frames += 1
                 self.frame = display_frame
                 self._tags = tags
+                self._frame_seq += 1
+                self._frame_resolution = frame_res
                 self.detections = detections
                 self.processing_latency = processing_latency
+                self.capture_latency = capture_latency
+                self._last_processed_at = now_m
 
             self.frame_count += 1
+            self._rate_count += 1
             self.fps_log_count += 1
 
-            if self.frame_count % 30 == 0:
-                end_time = time.time()
-                self.framerate = 30 / (end_time - self.start_time)
-                self.start_time = end_time
+            rate_elapsed = now_m - self.start_time
+            if self._rate_count >= 30 or (self._rate_count >= 5 and rate_elapsed >= 0.5):
+                if rate_elapsed > 0:
+                    self.framerate = self._rate_count / rate_elapsed
+                self.start_time = now_m
+                self._rate_count = 0
 
-            if self.fps_log_count >= 100:
-                current_time = time.time()
-                elapsed = current_time - self.fps_log_time
-                self.backend_fps = self.fps_log_count / elapsed
-                logger.Log(f"Camera {self.camera_id} ({self.pipeline_type}): {self.backend_fps:.2f} FPS | Latency: {processing_latency*1000:.2f}ms (since capture {capture_latency*1000:.2f}ms) | Detections: {len(detections)}")
-                self.fps_log_time = current_time
+            log_elapsed = now_m - self.fps_log_time
+            if self.fps_log_count >= 100 or (self.fps_log_count >= 10 and log_elapsed >= 2.0):
+                if log_elapsed > 0:
+                    self.backend_fps = self.fps_log_count / log_elapsed
+                    logger.Log(
+                        f"Camera {self.camera_id} ({self.pipeline_type}): {self.backend_fps:.2f} FPS | "
+                        f"Latency: {processing_latency*1000:.2f}ms (since capture {capture_latency*1000:.2f}ms) | "
+                        f"Detections: {len(detections)}"
+                    )
+                self.fps_log_time = now_m
                 self.fps_log_count = 0
 
         except Exception as e:
@@ -271,42 +394,111 @@ class CameraPipeline:
 
     def get_frame(self):
         with self.lock:
-            if self.frame is None or self._tags is None:
-                return self.frame
-            if self._overlay_src is not self.frame:
+            if self.frame is None:
+                return None
+            if self._tags is None:
+                return self.frame.copy()
+            if self._overlay_seq != self._frame_seq:
                 self._overlay = localization.detection.ANNOTATE_TAGS(self.frame, *self._tags)
-                self._overlay_src = self.frame
+                self._overlay_seq = self._frame_seq
             return self._overlay
 
+    def get_frame_seq(self) -> int:
+        return self._frame_seq
+
     def get_preview_jpeg(self, quality: int, max_width: int):
+        quality = max(1, min(100, int(quality)))
+        max_width = max(1, int(max_width))
         with self.lock:
-            frame, tags = self.frame, self._tags
-        if frame is None:
-            return None, None
-        source, cached_quality, jpeg = self._preview
-        if source is frame and cached_quality == quality:
-            return frame, jpeg
-        scale = min(1.0, max_width / frame.shape[1])
-        small = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1.0 else frame
+            frame, tags, seq = self.frame, self._tags, self._frame_seq
+            if frame is None:
+                return None, None
+            with self._preview_lock:
+                if self._preview_seq == seq:
+                    cached = self._preview_cache.get((quality, max_width))
+                    if cached is not None:
+                        return self._preview_frame, cached
+            # Copy inside self.lock only on a preview cache miss (<= STREAM_MAX_FPS)
+            # so ring-buffered decoder frames cannot tear while resizing/encoding.
+            frame_copy = frame.copy()
+
+        scale = min(1.0, max_width / frame_copy.shape[1])
+        if scale < 1.0:
+            dst_w = max(1, int(round(frame_copy.shape[1] * scale)))
+            dst_h = max(1, int(round(frame_copy.shape[0] * scale)))
+            small = cv2.resize(frame_copy, (dst_w, dst_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            small = frame_copy
+
         if tags is not None:
             corners, ids = tags
-            small = localization.detection.ANNOTATE_TAGS(small, [c * scale for c in corners], ids)
-        jpeg = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, quality])[1].tobytes()
-        self._preview = (frame, quality, jpeg)
-        return frame, jpeg
+            if ids is not None and len(ids) > 0:
+                scaled_corners = [c * scale for c in corners] if scale < 1.0 else corners
+                small = localization.detection.ANNOTATE_TAGS(small, scaled_corners, ids)
+
+        ok, buf = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if not ok:
+            return None, None
+        jpeg = buf.tobytes()
+
+        with self._preview_lock:
+            if self._preview_seq != seq:
+                self._preview_cache.clear()
+                self._preview_seq = seq
+                self._preview_frame = frame_copy
+            self._preview_cache[(quality, max_width)] = jpeg
+            token_frame = self._preview_frame
+        return token_frame, jpeg
 
     def get_detections(self):
         with self.lock:
             return list(self.detections)
 
+    def get_detection_summary(self) -> List[dict]:
+        items = []
+        for det in self.get_detections():
+            if hasattr(det, "getTag"):
+                items.append({
+                    "tag": int(det.getTag()),
+                    "r": round(float(det.getR()), 2),
+                    "theta": round(float(det.getTheta()), 2),
+                })
+            else:
+                items.append({
+                    "r": round(float(det.getR()), 2),
+                    "theta": round(float(det.getTheta()), 2),
+                    "on_top": bool(det.isOnTop()),
+                })
+        return items
+
+    def _is_stale(self) -> bool:
+        if not self.enabled:
+            return True
+        last = self._last_processed_at
+        return last > 0.0 and (time.monotonic() - last) > 2.5
+
     def get_framerate(self):
+        if self._is_stale():
+            return 0.0
         return self.framerate
 
     def get_backend_fps(self):
+        if self._is_stale():
+            return 0.0
         return self.backend_fps
+
+    def get_fps(self) -> float:
+        backend = self.get_backend_fps()
+        return backend if backend > 0.0 else self.get_framerate()
 
     def get_processing_latency(self):
         return self.processing_latency
+
+    def get_capture_latency(self):
+        return self.capture_latency
+
+    def get_resolution(self) -> Tuple[int, int]:
+        return self._frame_resolution
 
     def get_camera_id(self):
         return self.camera_id
@@ -319,12 +511,17 @@ class CameraPipeline:
 
     def set_enabled(self, enabled: bool):
         self.enabled = enabled
+        if enabled:
+            self._enabled_event.set()
+        else:
+            self._enabled_event.clear()
 
     def is_enabled(self):
         return self.enabled
 
     def stop(self):
         self.running = False
+        self._enabled_event.set()
         try:
             with self.lock:
                 if self._writer is not None:
@@ -333,6 +530,9 @@ class CameraPipeline:
                     self._recording_pending = False
                 if self.cam:
                     self.cam.release()
+            det_obj = getattr(self._apriltag, "__self__", None)
+            if det_obj is not None and hasattr(det_obj, "close"):
+                det_obj.close()
         except Exception as e:
             logger.Warn(f"Error releasing camera {self.camera_id}: {e}")
 
@@ -359,20 +559,27 @@ class VisionManager:
         self.threads: List[Thread] = []
 
     def execute(self):
-        for camera_id, pipeline in self.pipelines.items():
-            thread = Thread(target=self._run_pipeline, args=(pipeline,), daemon=True)
+        for camera_id, cam_pipeline in self.pipelines.items():
+            thread = Thread(target=self._run_pipeline, args=(cam_pipeline,), daemon=True)
             thread.start()
             self.threads.append(thread)
 
         for thread in self.threads:
             thread.join()
 
-    def _run_pipeline(self, pipeline: CameraPipeline):
-        while pipeline.running:
+    def stop_all(self):
+        for cam_pipeline in list(self.pipelines.values()):
+            cam_pipeline.stop()
+        for thread in list(self.threads):
+            thread.join(timeout=1.0)
+
+    def _run_pipeline(self, cam_pipeline: CameraPipeline):
+        pin_current_thread_big_cores()
+        while cam_pipeline.running:
             try:
-                pipeline.process_frame()
+                cam_pipeline.process_frame()
             except Exception as e:
-                print(f"Error in pipeline {pipeline.camera_id}: {e}")
+                print(f"Error in pipeline {cam_pipeline.camera_id}: {e}")
                 time.sleep(0.1)
 
     def get_pipeline(self, camera_id: int) -> CameraPipeline:
@@ -411,21 +618,25 @@ class VisionManager:
             for cam_pipeline in list(self.pipelines.values()):
                 try:
                     cam_pipeline.running = False
-                except:
+                    cam_pipeline._enabled_event.set()
+                except Exception:
                     pass
 
-            time.sleep(1.5)
+            for thread in list(self.threads):
+                try:
+                    thread.join(timeout=1.0)
+                except Exception:
+                    pass
 
             for cam_pipeline in list(self.pipelines.values()):
                 try:
                     if hasattr(cam_pipeline, 'cam') and cam_pipeline.cam:
                         cam_pipeline.cam.release()
-                except:
+                except Exception:
                     pass
 
             self.threads = []
 
-            import platform
             if platform.system() == "Windows":
                 time.sleep(1.5)
             else:
@@ -436,19 +647,19 @@ class VisionManager:
 
             try:
                 pipeline.ntables.reset_instance()
-            except:
+            except Exception:
                 pass
 
             if "network_tables" in self.config and "server" in self.config["network_tables"]:
                 try:
                     pipeline.ntables.set_server(self.config["network_tables"]["server"])
-                except:
+                except Exception:
                     pass
 
             if "valid_apriltag_ids" in self.config:
                 try:
                     localization.apriltag_solution.SET_VALID_TAG_IDS(self.config["valid_apriltag_ids"])
-                except:
+                except Exception:
                     pass
 
             self.pipelines = {}
@@ -463,7 +674,7 @@ class VisionManager:
                     thread = Thread(target=self._run_pipeline, args=(cam_pipeline,), daemon=True)
                     thread.start()
                     self.threads.append(thread)
-                except:
+                except Exception:
                     pass
 
             logger.Log("All pipelines reloaded successfully")
