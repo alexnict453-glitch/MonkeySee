@@ -322,6 +322,18 @@ class CameraReader:
         with self._lock:
             self._tag_frame, self._tag_corners, self._frames_since_tags = frame, corners, 0
 
+    def update_auto_gain(self, frame: Optional[MatLike], corners=None) -> None:
+        if frame is None or platform.system() != "Linux":
+            return
+        if not self._auto_gain.valueInt():
+            return
+        with self._lock:
+            if not self.cap or not self.cap.isOpened():
+                return
+            if corners is not None and len(corners) > 0:
+                self._tag_frame, self._tag_corners, self._frames_since_tags = frame, corners, 0
+            self._auto_gain_locked(frame)
+
     def retune_gain(self) -> None:
         with self._lock:
             self._gain_locked = False
@@ -375,7 +387,7 @@ class CameraReader:
             return captured
         return now
 
-    def get_frame(self) -> Tuple[Optional[MatLike], int]:
+    def get_frame(self, defer_auto_gain: bool = False) -> Tuple[Optional[MatLike], int]:
         """Returns (frame, capture time in monotonic_ns())."""
         with self._lock:
             if not self._opened:
@@ -400,7 +412,7 @@ class CameraReader:
                     self._reapply_exposure = False
                     self._apply_exposure_locked()
                 captured = self._capture_time_ns_locked()
-                if platform.system() == "Linux":
+                if not defer_auto_gain and platform.system() == "Linux":
                     self._auto_gain_locked(frame)
                 return frame, captured
 

@@ -80,6 +80,24 @@ def pin_current_thread_little_cores() -> bool:
     return _pin_current_thread(_LITTLE_CPUS)
 
 
+def _pipeline_detector_threads(cam_pipeline: "CameraPipeline") -> int:
+    det_obj = getattr(getattr(cam_pipeline, "_apriltag", None), "__self__", None)
+    return int(getattr(det_obj, "threads", 1)) if det_obj is not None else 1
+
+
+def _assign_pipeline_affinities(pipelines: Dict[int, "CameraPipeline"]) -> Dict[int, Optional[Set[int]]]:
+    if not _BIG_CPUS:
+        return {cid: None for cid in pipelines}
+    big_list = sorted(_BIG_CPUS)
+    active = [p for p in pipelines.values() if p.enabled]
+    if 1 < len(active) <= len(big_list) and all(_pipeline_detector_threads(p) <= 1 for p in active):
+        affinities: Dict[int, Optional[Set[int]]] = {cid: _BIG_CPUS for cid in pipelines}
+        for idx, cam_pipeline in enumerate(active):
+            affinities[cam_pipeline.camera_id] = {big_list[idx]}
+        return affinities
+    return {cid: _BIG_CPUS for cid in pipelines}
+
+
 def _supports_kwarg(fn, name: str) -> bool:
     try:
         params = inspect.signature(fn).parameters
@@ -208,7 +226,7 @@ class CameraPipeline:
         try:
             if not self.running:
                 return
-            frame, capture_ns = self.cam.get_frame()
+            frame, capture_ns = self.cam.get_frame(defer_auto_gain=True)
             cam_frame, jpeg = frame, self.cam.last_jpeg
             read_ns = monotonic_ns()
 
@@ -247,8 +265,6 @@ class CameraPipeline:
                 else:
                     frame = PROCESS_FRAME(raw_gray)
                     corners, ids = localization.detection.DETECT_TAGS(frame, refine_image=raw_gray)
-                if ids is not None:
-                    self.cam.note_tags(raw_gray, corners)
                 display_frame = frame
                 tags = (corners, ids)
                 detections = localization.apriltag_solution.CALCULATE_PARTIAL_SOLUTION(
@@ -265,6 +281,10 @@ class CameraPipeline:
             if self.pipeline_type == "apriltag":
                 self.ntables.updateFrameNum(self.frame_num)
             self.ntables.execute(detections, processing_latency, capture_ns)
+
+            gain_frame = raw_gray if self.pipeline_type == "apriltag" else frame
+            gain_corners = corners if (self.pipeline_type == "apriltag" and ids is not None) else None
+            self.cam.update_auto_gain(gain_frame, gain_corners)
 
             now_m = time.monotonic()
             with self.lock:
@@ -559,8 +579,13 @@ class VisionManager:
         self.threads: List[Thread] = []
 
     def execute(self):
+        affinities = _assign_pipeline_affinities(self.pipelines)
         for camera_id, cam_pipeline in self.pipelines.items():
-            thread = Thread(target=self._run_pipeline, args=(cam_pipeline,), daemon=True)
+            thread = Thread(
+                target=self._run_pipeline,
+                args=(cam_pipeline, affinities.get(camera_id)),
+                daemon=True,
+            )
             thread.start()
             self.threads.append(thread)
 
@@ -573,8 +598,11 @@ class VisionManager:
         for thread in list(self.threads):
             thread.join(timeout=1.0)
 
-    def _run_pipeline(self, cam_pipeline: CameraPipeline):
-        pin_current_thread_big_cores()
+    def _run_pipeline(self, cam_pipeline: CameraPipeline, core_affinity: Optional[Set[int]] = None):
+        if core_affinity is not None:
+            _pin_current_thread(core_affinity)
+        else:
+            pin_current_thread_big_cores()
         while cam_pipeline.running:
             try:
                 cam_pipeline.process_frame()
@@ -603,7 +631,8 @@ class VisionManager:
             if camera_config:
                 new_pipeline = CameraPipeline(camera_config)
                 self.pipelines[camera_id] = new_pipeline
-                thread = Thread(target=self._run_pipeline, args=(new_pipeline,), daemon=True)
+                affinity = _assign_pipeline_affinities(self.pipelines).get(camera_id)
+                thread = Thread(target=self._run_pipeline, args=(new_pipeline, affinity), daemon=True)
                 thread.start()
                 self.threads.append(thread)
 
@@ -669,9 +698,14 @@ class VisionManager:
                 except Exception as e:
                     logger.Warn(f"Error creating pipeline for camera {camera_config.get('id', 'unknown')}: {e}")
 
+            affinities = _assign_pipeline_affinities(self.pipelines)
             for cam_pipeline in self.pipelines.values():
                 try:
-                    thread = Thread(target=self._run_pipeline, args=(cam_pipeline,), daemon=True)
+                    thread = Thread(
+                        target=self._run_pipeline,
+                        args=(cam_pipeline, affinities.get(cam_pipeline.camera_id)),
+                        daemon=True,
+                    )
                     thread.start()
                     self.threads.append(thread)
                 except Exception:

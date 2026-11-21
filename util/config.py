@@ -82,6 +82,23 @@ class Config:
             self.save()
         else:
             self.value = representation.get("value", value)
+        self._int_cache: Optional[int] = None
+        self._float_cache: Optional[float] = None
+        self._refresh_cache()
+
+    def _refresh_cache(self) -> None:
+        self._int_cache = None
+        self._float_cache = None
+        if self.typev == 1:
+            try:
+                self._int_cache = int(self.value)
+            except (TypeError, ValueError):
+                pass
+        elif self.typev == 2:
+            try:
+                self._float_cache = float(self.value)
+            except (TypeError, ValueError):
+                pass
 
     def save(self) -> None:
         loaded_config[self.category] = loaded_config.get(self.category, {})
@@ -92,15 +109,23 @@ class Config:
         return self.value
     def valueInt(self) -> int:
         global config_logger
+        if self._int_cache is not None:
+            return self._int_cache
         try:
-            return int(self.value)
+            val = int(self.value)
+            self._int_cache = val
+            return val
         except:
             config_logger.Error(f"Couldn't convert {self.category}.{self.key} to int")
             return 0
     def valueFloat(self) -> float:
         global config_logger
+        if self._float_cache is not None:
+            return self._float_cache
         try:
-            return float(self.value)
+            val = float(self.value)
+            self._float_cache = val
+            return val
         except:
             config_logger.Error(f"Couldn't convert {self.category}.{self.key} to float")
             return 0.0
@@ -114,6 +139,8 @@ class Config:
         if self.value == new_value:
             return
         self.value = new_value
+        self._float_cache = float(value)
+        self._int_cache = None
         self.save()
 
     def setInt(self, value: int) -> None:
@@ -125,6 +152,8 @@ class Config:
         if self.value == new_value:
             return
         self.value = new_value
+        self._int_cache = int(value)
+        self._float_cache = None
         self.save()
 
     def __str__(self):

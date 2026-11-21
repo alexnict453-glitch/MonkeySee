@@ -277,7 +277,8 @@ class NativeNapaDetector:
             sharpening_x100=int(round(float(sharpening) * 100.0)),
             split_touching=int(split_touching),
         )
-        lib.napa_set_threads(self._det, max(1, min(16, int(threads))))
+        self.threads = max(1, min(16, int(threads)))
+        lib.napa_set_threads(self._det, self.threads)
 
     def set_camera_id(self, camera_id: Optional[int]) -> None:
         with self._lock:
@@ -555,6 +556,33 @@ def _build_native_napa(section: Optional[str], camera_id: Optional[int], cfg: di
         return None
 
 
+def _build_python_napa(NapaDetector, cfg: dict):
+    base_args = dict(
+        min_tag_px=cfg["min_tag_px"],
+        max_hamming=cfg["max_hamming"],
+        min_contrast=cfg["min_contrast"],
+        sharpening=cfg["sharpening"],
+    )
+    shadow_px = cfg["shadow_min_tag_px"] if cfg["shadow_min_tag_px"] > 0 else None
+    try:
+        return NapaDetector(
+            **base_args,
+            split_touching=bool(cfg["split_touching"]),
+            recover_shadows=bool(cfg["recover_shadows"]),
+            shadow_min_tag_px=shadow_px,
+            threads=cfg["threads"],
+        )
+    except TypeError:
+        try:
+            return NapaDetector(
+                **base_args,
+                split_touching=bool(cfg["split_touching"]),
+                recover_shadows=bool(cfg["recover_shadows"]),
+            )
+        except TypeError:
+            return NapaDetector(**base_args)
+
+
 def MAKE_APRILTAG_DETECTOR(section: str, camera_id: Optional[int] = None) -> Optional[Callable]:
     settings = ConfigCategory(section)
     napa_min_tag_px = settings.getIntConfig("napa_min_tag_px", 0).valueInt()
@@ -577,12 +605,7 @@ def MAKE_APRILTAG_DETECTOR(section: str, camera_id: Optional[int] = None) -> Opt
         except ImportError:
             logger.Warn(f"{section}: napa_vision not installed, trying robotpy_apriltag")
         else:
-            napa = NapaDetector(
-                min_tag_px=napa_min_tag_px,
-                max_hamming=cfg["max_hamming"],
-                min_contrast=cfg["min_contrast"],
-                sharpening=cfg["sharpening"],
-            )
+            napa = _build_python_napa(NapaDetector, cfg)
             logger.Log(f"{section}: NAPA detector, min_tag_px {napa_min_tag_px}")
             return lambda image: DETECT_NAPA(napa, image)
 
@@ -639,12 +662,7 @@ def _get_cached_napa_detector(config_key: Optional[str], camera_id: Optional[int
         py_det = _py_napa_cache.get(key)
         if py_det is None:
             from napa_vision import NapaDetector
-            py_det = NapaDetector(
-                min_tag_px=cfg["min_tag_px"],
-                max_hamming=cfg["max_hamming"],
-                min_contrast=cfg["min_contrast"],
-                sharpening=cfg["sharpening"],
-            )
+            py_det = _build_python_napa(NapaDetector, cfg)
             _py_napa_cache[key] = py_det
         return py_det, False
 

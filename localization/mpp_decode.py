@@ -84,17 +84,17 @@ def _load_mpp_library(lib_path: Optional[str] = None):
 
 
 def _as_uint8_view(raw) -> Tuple[np.ndarray, object]:
-    """Return a contiguous uint8 1D numpy view plus keepalive reference."""
+    """Return a contiguous uint8 numpy view plus keepalive reference."""
     if isinstance(raw, np.ndarray):
         arr = raw if (raw.dtype == np.uint8 and raw.flags["C_CONTIGUOUS"]) else np.ascontiguousarray(raw, dtype=np.uint8)
-        return arr.ravel(), arr
+        return arr, arr
     arr = np.frombuffer(raw, dtype=np.uint8)
     return arr, raw
 
 
 def _jpeg_dimensions(arr: np.ndarray) -> Optional[Tuple[int, int]]:
     """Parse JPEG SOF width and height without decoding."""
-    view = memoryview(arr)
+    view = memoryview(arr.ravel())
     n = len(view)
     if n < 4 or view[0] != 0xFF or view[1] != 0xD8:
         return None
@@ -145,6 +145,7 @@ class MppMjpegDecoder:
         self._lib = _load_mpp_library(lib_path)
         self._dec: Optional[int] = None
         self._ring: List[np.ndarray] = []
+        self._ring_2d: List[np.ndarray] = []
         self._ring_idx = 0
         self._w_c = ctypes.c_int()
         self._h_c = ctypes.c_int()
@@ -170,6 +171,7 @@ class MppMjpegDecoder:
         cap = max(1, self._max_w * self._max_h)
         # Pre-touch pages at init so 120 FPS decode avoids per-frame mmap page faults.
         self._ring = [np.zeros(cap, dtype=np.uint8) for _ in range(_RING_SLOTS)]
+        self._ring_2d = [buf.reshape(self._max_h, self._max_w) for buf in self._ring]
         self._ring_idx = 0
 
     def _recreate_locked(self, max_w: int, max_h: int) -> bool:
@@ -185,12 +187,13 @@ class MppMjpegDecoder:
             logger.Warn(f"mpp_mjpeg_create({self._max_w}, {self._max_h}) failed; using OpenCV fallback")
             self._dec = None
             self._ring = []
+            self._ring_2d = []
             return False
         self._alloc_ring_locked()
         return True
 
     def _fallback_imdecode(self, arr: np.ndarray, out: Optional[np.ndarray]) -> Optional[np.ndarray]:
-        img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+        img = cv2.imdecode(arr.ravel(), cv2.IMREAD_GRAYSCALE)
         if img is None:
             return None
         if out is not None and out.dtype == np.uint8 and out.flags["C_CONTIGUOUS"] and out.nbytes >= img.nbytes:
@@ -199,6 +202,39 @@ class MppMjpegDecoder:
             np.copyto(dst, img)
             return dst
         return img
+
+    def _decode_with_mpp_locked(
+        self, arr: np.ndarray, nbytes: int, out: Optional[np.ndarray], min_bytes: int = 0
+    ) -> Tuple[int, Optional[np.ndarray]]:
+        target = None
+        used_ring = False
+        if out is not None and out.dtype == np.uint8 and out.flags["C_CONTIGUOUS"] and out.nbytes >= min_bytes:
+            target = out
+        if target is None:
+            idx = self._ring_idx
+            target = self._ring[idx]
+            used_ring = True
+
+        rc = self._lib.mpp_mjpeg_decode_gray(
+            self._dec,
+            arr.ctypes.data,
+            nbytes,
+            target.ctypes.data,
+            int(target.nbytes),
+            ctypes.byref(self._w_c),
+            ctypes.byref(self._h_c),
+            ctypes.byref(self._fmt_c),
+        )
+        if rc == 0:
+            w_out = self._w_c.value
+            h_out = self._h_c.value
+            if w_out > 0 and h_out > 0 and target.nbytes >= w_out * h_out:
+                if used_ring:
+                    self._ring_idx = (idx + 1) % _RING_SLOTS
+                    if w_out == self._max_w and h_out == self._max_h:
+                        return 0, self._ring_2d[idx]
+                return 0, target.ravel()[: w_out * h_out].reshape(h_out, w_out)
+        return rc, None
 
     def decode_gray(self, raw, out: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
         """Decode raw MJPEG bytes/array to 2D uint8 grayscale, falling back to cv2.imdecode."""
@@ -211,41 +247,25 @@ class MppMjpegDecoder:
 
         with self._lock:
             if self._dec is not None:
+                max_pkt = max(self._max_w * self._max_h * 2, 2 << 20)
+                if nbytes <= max_pkt:
+                    rc, decoded = self._decode_with_mpp_locked(arr, nbytes, out)
+                    if decoded is not None:
+                        return decoded
+                else:
+                    rc = -1
+
+                # Slow path: only inspect JPEG SOF headers if hardware decode failed or packet exceeded max_pkt.
                 dims = _jpeg_dimensions(arr)
                 if dims is not None:
                     w_hdr, h_hdr = dims
                     if w_hdr > self._max_w or h_hdr > self._max_h:
-                        self._recreate_locked(w_hdr, h_hdr)
-
-                if self._dec is not None:
-                    max_pkt = max(self._max_w * self._max_h * 2, 2 << 20)
-                    if nbytes <= max_pkt:
-                        target = None
-                        used_ring = False
-                        if out is not None and out.dtype == np.uint8 and out.flags["C_CONTIGUOUS"]:
-                            if dims is None or out.nbytes >= dims[0] * dims[1]:
-                                target = out
-                        if target is None:
-                            target = self._ring[self._ring_idx]
-                            used_ring = True
-
-                        rc = self._lib.mpp_mjpeg_decode_gray(
-                            self._dec,
-                            arr.ctypes.data,
-                            nbytes,
-                            target.ctypes.data,
-                            int(target.nbytes),
-                            ctypes.byref(self._w_c),
-                            ctypes.byref(self._h_c),
-                            ctypes.byref(self._fmt_c),
-                        )
-                        if rc == 0:
-                            w_out = self._w_c.value
-                            h_out = self._h_c.value
-                            if w_out > 0 and h_out > 0 and target.nbytes >= w_out * h_out:
-                                if used_ring:
-                                    self._ring_idx = (self._ring_idx + 1) % _RING_SLOTS
-                                return target.ravel()[: w_out * h_out].reshape(h_out, w_out)
+                        if self._recreate_locked(w_hdr, h_hdr):
+                            max_pkt = max(self._max_w * self._max_h * 2, 2 << 20)
+                            if nbytes <= max_pkt:
+                                _, decoded = self._decode_with_mpp_locked(arr, nbytes, out, min_bytes=w_hdr * h_hdr)
+                                if decoded is not None:
+                                    return decoded
 
         return self._fallback_imdecode(arr, out)
 
@@ -258,6 +278,7 @@ class MppMjpegDecoder:
             lib = getattr(self, "_lib", None)
             self._dec = None
             self._ring = []
+            self._ring_2d = []
             if dec is not None and lib is not None:
                 try:
                     lib.mpp_mjpeg_destroy(dec)
