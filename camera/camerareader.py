@@ -12,14 +12,18 @@ import shutil
 import subprocess
 
 try:
-    from localization.mpp_decode import MppMjpegDecoder
+    from localization.mpp_decode import MppMjpegDecoder, V4L2MppCamera
 except ImportError:
     MppMjpegDecoder = None
+    V4L2MppCamera = None
 
 logger = Logger("Camera")
 
-# v4l2 auto_exposure menu values
+# v4l2 auto_exposure menu values and standard UVC control IDs
 V4L2_EXPOSURE_MANUAL = 1
+V4L2_CID_GAIN = 0x00980913
+V4L2_CID_EXPOSURE_AUTO = 0x009A0901
+V4L2_CID_EXPOSURE_ABSOLUTE = 0x009A0902
 
 RESOLUTIONS = ((800, 600), (1280, 800))
 GAIN_MAX = 255
@@ -121,8 +125,31 @@ class CameraReader:
         self._last_frame: Optional[MatLike] = None
         self._last_frame_at = 0.0
         self.last_jpeg: Optional[MatLike] = None
+        self._v4l2_mpp = None
         self._mjpeg_decoder = None
-        self._init_mjpeg_decoder_locked()
+
+    def _is_open_locked(self) -> bool:
+        v4l2_cam = getattr(self, "_v4l2_mpp", None)
+        if v4l2_cam is not None and v4l2_cam.available:
+            return True
+        return bool(self.cap and self.cap.isOpened())
+
+    def _set_ctrl_locked(self, cv_prop: int, v4l2_cid: int, value: int) -> None:
+        v4l2_cam = getattr(self, "_v4l2_mpp", None)
+        if v4l2_cam is not None:
+            v4l2_cam.set_ctrl(v4l2_cid, int(value))
+            return
+        if self.cap is not None:
+            self.cap.set(cv_prop, value)
+
+    def _get_ctrl_locked(self, cv_prop: int, v4l2_cid: int) -> int:
+        v4l2_cam = getattr(self, "_v4l2_mpp", None)
+        if v4l2_cam is not None:
+            val = v4l2_cam.get_ctrl(v4l2_cid)
+            return int(val) if val is not None else -1
+        if self.cap is not None:
+            return int(round(self.cap.get(cv_prop)))
+        return -1
 
     def _init_mjpeg_decoder_locked(self) -> None:
         if platform.system() != "Linux" or not self.use_preprocessing or MppMjpegDecoder is None:
@@ -153,11 +180,47 @@ class CameraReader:
 
     def _open_camera_locked(self):
         logger.Log("Opening camera...")
-        self._init_mjpeg_decoder_locked()
 
+        had_open = (getattr(self, "_v4l2_mpp", None) is not None) or (self.cap is not None)
+        if getattr(self, "_v4l2_mpp", None) is not None:
+            try:
+                self._v4l2_mpp.close()
+            except Exception:
+                pass
+            self._v4l2_mpp = None
         if self.cap:
             self.cap.release()
+            self.cap = None
+        if had_open:
             sleep(self.REOPEN_SLEEP_S)
+
+        buffersize = getattr(self, "_buffersize", self.DEFAULT_BUFFERSIZE)
+        if platform.system() == "Linux" and self.use_preprocessing and V4L2MppCamera is not None:
+            width, height = self.get_resolution()
+            try:
+                v4l2_cam = V4L2MppCamera(
+                    self.camera_path,
+                    width=width,
+                    height=height,
+                    fps=120,
+                    buffersize=buffersize,
+                    cachable=True,
+                )
+                if v4l2_cam.available:
+                    self._v4l2_mpp = v4l2_cam
+                    self._apply_exposure_locked()
+                    self._reapply_exposure = True
+                    self.fail_count = 0
+                    logger.Log(
+                        f"Camera opened successfully (V4L2+MPP): {v4l2_cam.width}x{v4l2_cam.height} "
+                        f"@ {v4l2_cam.fps:.1f}fps fourcc=MJPG buf={v4l2_cam.buffers}"
+                    )
+                    return
+                v4l2_cam.close()
+            except Exception as e:
+                logger.Warn(f"{self.camera_id}: V4L2+MPP open failed, falling back to VideoCapture: {e}")
+
+        self._init_mjpeg_decoder_locked()
 
         if platform.system() in ["Windows", "Darwin"]:
             self.cap = cv2.VideoCapture(0)
@@ -169,7 +232,7 @@ class CameraReader:
             return
 
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, getattr(self, "_buffersize", self.DEFAULT_BUFFERSIZE))
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, buffersize)
 
         if self.use_preprocessing:
             width, height = self.get_resolution()
@@ -203,7 +266,7 @@ class CameraReader:
         if platform.system() != "Linux":
             self._exposure_status = "Exposure control requires Linux (V4L2)"
             return
-        if not self.cap or not self.cap.isOpened():
+        if not self._is_open_locked():
             return
 
         auto = self._auto_gain.valueInt() != 0
@@ -211,9 +274,9 @@ class CameraReader:
         gain = self._live_gain if auto else self._gain.valueInt()
         self._live_gain = gain
 
-        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, V4L2_EXPOSURE_MANUAL)
-        self.cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
-        self.cap.set(cv2.CAP_PROP_GAIN, gain)
+        self._set_ctrl_locked(cv2.CAP_PROP_AUTO_EXPOSURE, V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_MANUAL)
+        self._set_ctrl_locked(cv2.CAP_PROP_EXPOSURE, V4L2_CID_EXPOSURE_ABSOLUTE, exposure)
+        self._set_ctrl_locked(cv2.CAP_PROP_GAIN, V4L2_CID_GAIN, gain)
         if self._read_exposure_locked()[1:] != (exposure, gain):
             self._apply_with_v4l2_ctl(exposure, gain)
 
@@ -235,9 +298,9 @@ class CameraReader:
 
     def _read_exposure_locked(self) -> Tuple[int, int, int]:
         return (
-            int(round(self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE))),
-            int(round(self.cap.get(cv2.CAP_PROP_EXPOSURE))),
-            int(round(self.cap.get(cv2.CAP_PROP_GAIN))),
+            self._get_ctrl_locked(cv2.CAP_PROP_AUTO_EXPOSURE, V4L2_CID_EXPOSURE_AUTO),
+            self._get_ctrl_locked(cv2.CAP_PROP_EXPOSURE, V4L2_CID_EXPOSURE_ABSOLUTE),
+            self._get_ctrl_locked(cv2.CAP_PROP_GAIN, V4L2_CID_GAIN),
         )
 
     def _apply_with_v4l2_ctl(self, exposure: int, gain: int) -> None:
@@ -303,8 +366,10 @@ class CameraReader:
             self._gain_source = source
             logger.Log(f"{self.camera_id}: auto gain locked at gain {self._live_gain} on {source} {measured:.0f}, {saved}")
         elif gain != self._live_gain:
-            self.cap.set(cv2.CAP_PROP_GAIN, gain)
-            self._live_gain = int(round(self.cap.get(cv2.CAP_PROP_GAIN)))
+            self._set_ctrl_locked(cv2.CAP_PROP_GAIN, V4L2_CID_GAIN, gain)
+            reported_gain = self._get_ctrl_locked(cv2.CAP_PROP_GAIN, V4L2_CID_GAIN)
+            if reported_gain >= 0:
+                self._live_gain = reported_gain
 
         if self._gain_push_steps >= AUTO_GAIN_STUCK_STEPS and not self._gain_stuck:
             self._gain_stuck = True
@@ -328,7 +393,7 @@ class CameraReader:
         if not self._auto_gain.valueInt():
             return
         with self._lock:
-            if not self.cap or not self.cap.isOpened():
+            if not self._is_open_locked():
                 return
             if corners is not None and len(corners) > 0:
                 self._tag_frame, self._tag_corners, self._frames_since_tags = frame, corners, 0
@@ -387,22 +452,32 @@ class CameraReader:
             return captured
         return now
 
-    def get_frame(self, defer_auto_gain: bool = False) -> Tuple[Optional[MatLike], int]:
+    def get_frame(self, defer_auto_gain: bool = False, want_jpeg: bool = True) -> Tuple[Optional[MatLike], int]:
         """Returns (frame, capture time in monotonic_ns())."""
         with self._lock:
             if not self._opened:
                 self._open_camera_locked()
                 self._opened = True
-            if not self.cap or not self.cap.isOpened():
+            if not self._is_open_locked():
                 logger.Warn("Camera not open, reopening...")
                 self._open_camera_locked()
                 return None, monotonic_ns()
 
-            ret, frame = self.cap.read()
-            self.last_jpeg = None
-            if ret and frame is not None and frame.ndim == 2 and min(frame.shape) == 1:
-                self.last_jpeg = frame
-                frame = self._decode_mjpeg_gray_locked(frame)
+            v4l2_cam = getattr(self, "_v4l2_mpp", None)
+            if v4l2_cam is not None:
+                frame, captured, jpeg = v4l2_cam.grab_gray(timeout_ms=500, want_jpeg=want_jpeg)
+                self.last_jpeg = jpeg if want_jpeg else None
+                ret = frame is not None
+                if ret and captured <= 0:
+                    captured = monotonic_ns()
+            else:
+                ret, frame = self.cap.read()
+                self.last_jpeg = None
+                if ret and frame is not None and frame.ndim == 2 and min(frame.shape) == 1:
+                    if want_jpeg:
+                        self.last_jpeg = frame
+                    frame = self._decode_mjpeg_gray_locked(frame)
+                captured = self._capture_time_ns_locked() if (ret and frame is not None) else 0
 
             if ret and frame is not None:
                 self.fail_count = 0
@@ -411,7 +486,6 @@ class CameraReader:
                 if self._reapply_exposure:
                     self._reapply_exposure = False
                     self._apply_exposure_locked()
-                captured = self._capture_time_ns_locked()
                 if not defer_auto_gain and platform.system() == "Linux":
                     self._auto_gain_locked(frame)
                 return frame, captured
@@ -445,6 +519,12 @@ class CameraReader:
 
     def release(self):
         with self._lock:
+            if getattr(self, "_v4l2_mpp", None) is not None:
+                try:
+                    self._v4l2_mpp.close()
+                except Exception:
+                    pass
+                self._v4l2_mpp = None
             if self.cap:
                 self.cap.release()
                 self.cap = None
@@ -456,6 +536,7 @@ class CameraReader:
                 self._mjpeg_decoder = None
             self._opened = False
             self._last_frame = None
+            self.last_jpeg = None
 
 if __name__ == "__main__":
     assert next_gain(50, 95, 100) == (50, 0)

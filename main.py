@@ -1,3 +1,10 @@
+import cv2
+if hasattr(cv2, "setNumThreads"):
+    try:
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
+
 import pipeline.ntables
 from pipeline.visionmanager import VisionManager, pin_current_thread_little_cores
 import argparse

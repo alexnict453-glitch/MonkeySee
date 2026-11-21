@@ -13,12 +13,17 @@ logger = Logger("MppDecode")
 
 DEFAULT_MPP_LIB_PATH = "/usr/local/lib/libmpp_mjpeg.so"
 _FALLBACK_MPP_LIB_PATH = "/home/orangepi/opi5plus_bench/libmpp_mjpeg.so"
+DEFAULT_V4L2_MPP_LIB_PATH = "/usr/local/lib/libv4l2_mpp.so"
+_FALLBACK_V4L2_MPP_LIB_PATH = "/home/orangepi/MonkeySee/camera/libv4l2_mpp.so"
 _MPP_DEVICE_PATH = "/dev/mpp_service"
 _RING_SLOTS = 3
 
 _lib_lock = threading.Lock()
 _lib_loaded = False
 _lib_handle = None
+_v4l2_lib_lock = threading.Lock()
+_v4l2_lib_loaded = False
+_v4l2_lib_handle = None
 _thread_local = threading.local()
 
 
@@ -306,3 +311,262 @@ def decode_mjpeg_gray(raw, decoder: Optional[MppMjpegDecoder] = None, out: Optio
             decoder = MppMjpegDecoder()
             _thread_local.decoder = decoder
     return decoder.decode_gray(raw, out=out)
+
+
+def _load_v4l2_mpp_library(lib_path: Optional[str] = None):
+    """Load libv4l2_mpp.so with exact C ABI bindings, returning None if unavailable."""
+    global _v4l2_lib_loaded, _v4l2_lib_handle
+
+    custom_path = lib_path or os.environ.get("MONKEYSEE_V4L2_MPP_LIB")
+    if custom_path is None:
+        with _v4l2_lib_lock:
+            if _v4l2_lib_loaded:
+                return _v4l2_lib_handle
+
+    if platform.system() != "Linux" and custom_path is None:
+        with _v4l2_lib_lock:
+            _v4l2_lib_loaded = True
+            _v4l2_lib_handle = None
+        return None
+
+    if custom_path is None:
+        if not (os.path.exists(_MPP_DEVICE_PATH) and os.access(_MPP_DEVICE_PATH, os.R_OK | os.W_OK)):
+            with _v4l2_lib_lock:
+                _v4l2_lib_loaded = True
+                _v4l2_lib_handle = None
+            return None
+
+    candidates = (
+        [custom_path]
+        if custom_path
+        else [DEFAULT_V4L2_MPP_LIB_PATH, _FALLBACK_V4L2_MPP_LIB_PATH, "libv4l2_mpp.so"]
+    )
+    loaded = None
+    for path in candidates:
+        if not path:
+            continue
+        if os.path.isabs(path) and not os.path.exists(path):
+            continue
+        try:
+            lib = ctypes.CDLL(path)
+            lib.v4l2_mpp_open.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            lib.v4l2_mpp_open.restype = ctypes.c_void_p
+            lib.v4l2_mpp_close.argtypes = [ctypes.c_void_p]
+            lib.v4l2_mpp_close.restype = None
+            lib.v4l2_mpp_get_info.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+            ]
+            lib.v4l2_mpp_get_info.restype = ctypes.c_int
+            lib.v4l2_mpp_set_ctrl.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int]
+            lib.v4l2_mpp_set_ctrl.restype = ctypes.c_int
+            lib.v4l2_mpp_get_ctrl.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_int),
+            ]
+            lib.v4l2_mpp_get_ctrl.restype = ctypes.c_int
+            lib.v4l2_mpp_grab_gray.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int64),
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_int),
+            ]
+            lib.v4l2_mpp_grab_gray.restype = ctypes.c_int
+            loaded = lib
+            logger.Log(f"Loaded V4L2+MPP capture library: {path}")
+            break
+        except (OSError, AttributeError) as exc:
+            logger.Warn(f"Failed to load V4L2+MPP library {path}: {exc}")
+
+    if custom_path is None:
+        with _v4l2_lib_lock:
+            _v4l2_lib_loaded = True
+            _v4l2_lib_handle = loaded
+    return loaded
+
+
+class V4L2MppCamera:
+    """Direct Linux V4L2 MMAP + Rockchip MPP MJPEG-to-grayscale capture with 3-slot ring buffer."""
+
+    def __init__(
+        self,
+        dev_path: str,
+        width: int = 1280,
+        height: int = 800,
+        fps: int = 120,
+        buffersize: int = 2,
+        cachable: Union[bool, int] = True,
+        lib_path: Optional[str] = None,
+    ):
+        self._lock = threading.Lock()
+        self._lib = _load_v4l2_mpp_library(lib_path)
+        self._cam: Optional[int] = None
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = float(fps)
+        self.buffers = int(buffersize)
+        self._max_pkt = max(self.width * self.height * 2, 2 << 20)
+        self._ring: List[np.ndarray] = []
+        self._ring_2d: List[np.ndarray] = []
+        self._ring_idx = 0
+        self._jpeg_buf: Optional[np.ndarray] = None
+
+        self._w_c = ctypes.c_int()
+        self._h_c = ctypes.c_int()
+        self._ts_c = ctypes.c_int64()
+        self._jlen_c = ctypes.c_int()
+        self._drop_c = ctypes.c_int()
+        self._ctrl_c = ctypes.c_int()
+
+        if self._lib is not None and dev_path:
+            handle = self._lib.v4l2_mpp_open(
+                dev_path.encode("utf-8"),
+                int(width),
+                int(height),
+                int(fps),
+                int(buffersize),
+                1 if cachable else 0,
+            )
+            if handle:
+                self._cam = handle
+                w_c = ctypes.c_int()
+                h_c = ctypes.c_int()
+                fps_c = ctypes.c_double()
+                buf_c = ctypes.c_int()
+                pkt_c = ctypes.c_int()
+                if self._lib.v4l2_mpp_get_info(
+                    handle,
+                    ctypes.byref(w_c),
+                    ctypes.byref(h_c),
+                    ctypes.byref(fps_c),
+                    ctypes.byref(buf_c),
+                    ctypes.byref(pkt_c),
+                ) == 0:
+                    self.width = max(1, w_c.value)
+                    self.height = max(1, h_c.value)
+                    self.fps = fps_c.value if fps_c.value > 0 else float(fps)
+                    self.buffers = max(1, buf_c.value)
+                    self._max_pkt = max(pkt_c.value, 2 << 20)
+                cap = max(1, self.width * self.height)
+                # Pre-touch pages at init so 120 FPS capture avoids per-frame page faults.
+                self._ring = [np.zeros(cap, dtype=np.uint8) for _ in range(_RING_SLOTS)]
+                self._ring_2d = [buf.reshape(self.height, self.width) for buf in self._ring]
+
+    @property
+    def available(self) -> bool:
+        return self._cam is not None
+
+    def set_ctrl(self, ctrl_id: int, value: int) -> bool:
+        with self._lock:
+            if self._cam is None or self._lib is None:
+                return False
+            return self._lib.v4l2_mpp_set_ctrl(self._cam, int(ctrl_id), int(value)) == 0
+
+    def get_ctrl(self, ctrl_id: int) -> Optional[int]:
+        with self._lock:
+            if self._cam is None or self._lib is None:
+                return None
+            if self._lib.v4l2_mpp_get_ctrl(self._cam, int(ctrl_id), ctypes.byref(self._ctrl_c)) == 0:
+                return int(self._ctrl_c.value)
+            return None
+
+    def grab_gray(
+        self, timeout_ms: int = 500, want_jpeg: bool = False
+    ) -> Tuple[Optional[np.ndarray], int, Optional[np.ndarray]]:
+        """Grab latest V4L2 MJPEG frame, decode via MPP into ring buffer, return (gray, ts_ns, opt_jpeg)."""
+        with self._lock:
+            if self._cam is None or self._lib is None or not self._ring:
+                return None, 0, None
+
+            idx = self._ring_idx
+            target = self._ring[idx]
+            jpeg_ptr = 0
+            jpeg_cap = 0
+            if want_jpeg:
+                if self._jpeg_buf is None or self._jpeg_buf.nbytes < self._max_pkt:
+                    self._jpeg_buf = np.empty(self._max_pkt, dtype=np.uint8)
+                jpeg_ptr = int(self._jpeg_buf.ctypes.data)
+                jpeg_cap = int(self._jpeg_buf.nbytes)
+
+            rc = self._lib.v4l2_mpp_grab_gray(
+                self._cam,
+                int(timeout_ms),
+                target.ctypes.data,
+                int(target.nbytes),
+                ctypes.byref(self._w_c),
+                ctypes.byref(self._h_c),
+                ctypes.byref(self._ts_c),
+                jpeg_ptr,
+                jpeg_cap,
+                ctypes.byref(self._jlen_c),
+                ctypes.byref(self._drop_c),
+            )
+
+            jpeg_arr: Optional[np.ndarray] = None
+            jlen = int(self._jlen_c.value)
+            if want_jpeg and jlen > 0 and self._jpeg_buf is not None and jlen <= self._jpeg_buf.nbytes:
+                jpeg_arr = self._jpeg_buf[:jlen].copy().reshape(1, -1)
+
+            if rc == 0:
+                w_out = int(self._w_c.value)
+                h_out = int(self._h_c.value)
+                if w_out > 0 and h_out > 0 and target.nbytes >= w_out * h_out:
+                    self._ring_idx = (idx + 1) % _RING_SLOTS
+                    if w_out == self.width and h_out == self.height:
+                        return self._ring_2d[idx], int(self._ts_c.value), jpeg_arr
+                    return target[: w_out * h_out].reshape(h_out, w_out), int(self._ts_c.value), jpeg_arr
+
+            if jpeg_arr is not None:
+                fallback = cv2.imdecode(jpeg_arr.ravel(), cv2.IMREAD_GRAYSCALE)
+                if fallback is not None:
+                    return fallback, int(self._ts_c.value), jpeg_arr
+
+            return None, 0, None
+
+    def close(self) -> None:
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            return
+        with lock:
+            cam = getattr(self, "_cam", None)
+            lib = getattr(self, "_lib", None)
+            self._cam = None
+            self._ring = []
+            self._ring_2d = []
+            self._jpeg_buf = None
+            if cam is not None and lib is not None:
+                try:
+                    lib.v4l2_mpp_close(cam)
+                except Exception:
+                    pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass

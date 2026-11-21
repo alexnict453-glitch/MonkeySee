@@ -12,11 +12,18 @@ import json
 import os
 import struct
 from datetime import datetime
+import threading
 from threading import Event, Thread, Lock
 from camera.preprocess import PROCESS_FRAME
 from util.logger import Logger
 
 logger = Logger("VisionManager")
+
+if hasattr(cv2, "setNumThreads"):
+    try:
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
 
 CAPTURES_DIR = "captures"
 
@@ -80,9 +87,25 @@ def pin_current_thread_little_cores() -> bool:
     return _pin_current_thread(_LITTLE_CPUS)
 
 
+def _set_current_thread_nice(nice: int) -> bool:
+    """Set Linux scheduling priority for the calling kernel thread (no-op elsewhere)."""
+    if platform.system() != "Linux" or not hasattr(os, "setpriority"):
+        return False
+    tid = threading.get_native_id() if hasattr(threading, "get_native_id") else 0
+    if tid <= 0:
+        return False
+    try:
+        os.setpriority(os.PRIO_PROCESS, tid, int(nice))
+        return True
+    except OSError:
+        return False
+
+
 def _pipeline_detector_threads(cam_pipeline: "CameraPipeline") -> int:
     det_obj = getattr(getattr(cam_pipeline, "_apriltag", None), "__self__", None)
-    return int(getattr(det_obj, "threads", 1)) if det_obj is not None else 1
+    if det_obj is not None:
+        return int(getattr(det_obj, "threads", 1))
+    return int(getattr(cam_pipeline, "_detector_threads", 1))
 
 
 def _assign_pipeline_affinities(pipelines: Dict[int, "CameraPipeline"]) -> Dict[int, Optional[Set[int]]]:
@@ -137,12 +160,6 @@ class CameraPipeline:
 
         use_high_res = self.pipeline_type == "apriltag"
 
-        settings_category = f"Camera{self.camera_id}"
-        if platform.system() == "Windows" or platform.system() == "Darwin":
-            self.cam = CameraReader(self.device_id if self.camera_id == 0 else self.camera_id - 1, use_high_res, settings_category)
-        else:
-            self.cam = CameraReader(self.device_id, use_high_res, settings_category)
-
         self.frame_count = 0
         self._rate_count = 0
         self.start_time = time.monotonic()
@@ -153,7 +170,6 @@ class CameraPipeline:
         self.processing_latency = 0.0
         self.capture_latency = 0.0
         self._last_processed_at = 0.0
-        self._frame_resolution: Tuple[int, int] = self.cam.get_resolution()
         self.frame: cv2.typing.MatLike = None
         self._tags = None
         self._frame_seq = 0
@@ -179,42 +195,68 @@ class CameraPipeline:
         self._recording_pending = False
         self._last_capture_message = ""
 
-        if self.pipeline_type == "apriltag":
-            apriltag_section = camera_config.get("apriltag_config", f"AprilTag{self.camera_id}")
-            localization.apriltag_solution.SET_CAM(self.camera_id, apriltag_section)
-            prev_cpus = None
-            if _BIG_CPUS and platform.system() == "Linux" and hasattr(os, "sched_getaffinity"):
-                try:
-                    prev_cpus = os.sched_getaffinity(0)
-                    os.sched_setaffinity(0, _BIG_CPUS)
-                except OSError:
-                    prev_cpus = None
+        prev_cpus = None
+        if _BIG_CPUS and platform.system() == "Linux" and hasattr(os, "sched_getaffinity"):
             try:
-                if _supports_kwarg(localization.detection.MAKE_APRILTAG_DETECTOR, "camera_id"):
-                    self._apriltag = localization.detection.MAKE_APRILTAG_DETECTOR(
-                        apriltag_section, camera_id=self.camera_id
-                    )
-                else:
-                    self._apriltag = localization.detection.MAKE_APRILTAG_DETECTOR(apriltag_section)
-            finally:
-                if prev_cpus is not None:
-                    try:
-                        os.sched_setaffinity(0, prev_cpus)
-                    except OSError:
-                        pass
+                prev_cpus = os.sched_getaffinity(0)
+                os.sched_setaffinity(0, _BIG_CPUS)
+            except OSError:
+                prev_cpus = None
+        try:
+            settings_category = f"Camera{self.camera_id}"
+            if platform.system() == "Windows" or platform.system() == "Darwin":
+                self.cam = CameraReader(self.device_id if self.camera_id == 0 else self.camera_id - 1, use_high_res, settings_category)
+            else:
+                self.cam = CameraReader(self.device_id, use_high_res, settings_category)
+
+            self._frame_resolution: Tuple[int, int] = self.cam.get_resolution()
+            self._cam_accepts_want_jpeg = _supports_kwarg(self.cam.get_frame, "want_jpeg")
+
+            if self.pipeline_type == "apriltag":
+                apriltag_section = camera_config.get("apriltag_config", f"AprilTag{self.camera_id}")
+                self._apriltag_section = apriltag_section
+                localization.apriltag_solution.SET_CAM(self.camera_id, apriltag_section)
+                resolver = getattr(localization.detection, "_resolve_napa_settings", None)
+                self._detector_threads = int(resolver(apriltag_section).get("threads", 2)) if callable(resolver) else 2
+                self._apriltag = None
+                self._apriltag_accepts_cam_id = False
+                self._apriltag_initialized = False
+                self.ntables = pipeline.ntables.AprilTagNTables(self.camera_id)
+            else:
+                from localization import gamepiece_solution
+                from localization import visiony
+                gamepiece_solution.SET_CAM(self.camera_id)
+                self.ntables = pipeline.ntables.GamePieceNTables(self.camera_id)
+                self._visiony = visiony
+                self._gamepiece_solution = gamepiece_solution
+                self._apriltag_section = None
+                self._detector_threads = 1
+                self._apriltag = None
+                self._apriltag_accepts_cam_id = False
+                self._apriltag_initialized = True
+        finally:
+            if prev_cpus is not None:
+                try:
+                    os.sched_setaffinity(0, prev_cpus)
+                except OSError:
+                    pass
+
+    def _ensure_apriltag_ready(self) -> None:
+        if self._apriltag_initialized or self.pipeline_type != "apriltag":
+            return
+        with self.lock:
+            if self._apriltag_initialized or self.pipeline_type != "apriltag":
+                return
+            if _supports_kwarg(localization.detection.MAKE_APRILTAG_DETECTOR, "camera_id"):
+                self._apriltag = localization.detection.MAKE_APRILTAG_DETECTOR(
+                    self._apriltag_section, camera_id=self.camera_id
+                )
+            else:
+                self._apriltag = localization.detection.MAKE_APRILTAG_DETECTOR(self._apriltag_section)
             self._apriltag_accepts_cam_id = (
                 self._apriltag is not None and _supports_kwarg(self._apriltag, "camera_id")
             )
-            self.ntables = pipeline.ntables.AprilTagNTables(self.camera_id)
-        else:
-            from localization import gamepiece_solution
-            from localization import visiony
-            gamepiece_solution.SET_CAM(self.camera_id)
-            self.ntables = pipeline.ntables.GamePieceNTables(self.camera_id)
-            self._visiony = visiony
-            self._gamepiece_solution = gamepiece_solution
-            self._apriltag = None
-            self._apriltag_accepts_cam_id = False
+            self._apriltag_initialized = True
 
     def process_frame(self):
         if not self.running:
@@ -226,7 +268,13 @@ class CameraPipeline:
         try:
             if not self.running:
                 return
-            frame, capture_ns = self.cam.get_frame(defer_auto_gain=True)
+            if not self._apriltag_initialized:
+                self._ensure_apriltag_ready()
+            want_jpeg = self._writer is not None or self._recording_pending
+            if self._cam_accepts_want_jpeg:
+                frame, capture_ns = self.cam.get_frame(defer_auto_gain=True, want_jpeg=want_jpeg)
+            else:
+                frame, capture_ns = self.cam.get_frame(defer_auto_gain=True)
             cam_frame, jpeg = frame, self.cam.last_jpeg
             read_ns = monotonic_ns()
 
@@ -603,6 +651,8 @@ class VisionManager:
             _pin_current_thread(core_affinity)
         else:
             pin_current_thread_big_cores()
+        _set_current_thread_nice(-10)
+        cam_pipeline._ensure_apriltag_ready()
         while cam_pipeline.running:
             try:
                 cam_pipeline.process_frame()
