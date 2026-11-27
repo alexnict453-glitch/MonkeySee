@@ -11,6 +11,7 @@ CAL_PATH = "cal.json"
 
 calibrations: Dict[int, dict] = {}
 _calibrations_loaded = False
+_cal_generation = 0
 
 _camera_matrices: Dict[Tuple[int, int, int], np.ndarray] = {}
 _dist_coeffs: Dict[Tuple[int, int, int], np.ndarray] = {}
@@ -20,7 +21,7 @@ def calibration_key(camera_id: int, width: int, height: int) -> str:
     return f"{camera_id}@{width}x{height}"
 
 def load_all_calibrations(force: bool = False):
-    global calibrations, _calibrations_loaded, _camera_matrices, _dist_coeffs
+    global calibrations, _calibrations_loaded, _camera_matrices, _dist_coeffs, _cal_generation
     
     if _calibrations_loaded and not force:
         return
@@ -45,6 +46,7 @@ def load_all_calibrations(force: bool = False):
                 logger.Warn(f"Camera {cam_id} missing OpenCV calibration data. Please recalibrate using /calibration tab.")
         
         calibrations, _camera_matrices, _dist_coeffs = cals, matrices, dists
+        _cal_generation += 1
         logger.Log(f"Loaded calibrations for cameras: {list(calibrations.keys())}")
         _calibrations_loaded = True
     except FileNotFoundError:
@@ -99,6 +101,18 @@ def calibration_for(camera_id: int, width: int, height: int) -> Optional[Tuple[n
             logger.Error(f"No OpenCV calibration found for camera {camera_id} at {width}x{height}. Please calibrate using the /calibration tab.")
         return None
     return camera_matrix, dist_coeffs
+
+
+def get_calibration_silent(camera_id: int, width: int, height: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Lookup calibration matrix and distortion coeffs in one dict probe without logging."""
+    if not _calibrations_loaded:
+        load_all_calibrations()
+    key = (camera_id, width, height)
+    camera_matrix = _camera_matrices.get(key)
+    if camera_matrix is None:
+        return None
+    dist_coeffs = _dist_coeffs.get(key)
+    return (camera_matrix, dist_coeffs) if dist_coeffs is not None else None
 
 def GET_CAMERA_ANGLES(
     x_img: float,

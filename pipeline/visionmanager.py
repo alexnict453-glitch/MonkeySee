@@ -15,8 +15,16 @@ import struct
 from datetime import datetime
 import threading
 from threading import Event, Thread, Lock
-from camera.preprocess import PROCESS_FRAME
 from util.logger import Logger
+
+try:
+    from localization.native_pipeline import NativeVisionWorker, load_native_vision_lib
+except ImportError:
+    NativeVisionWorker = None
+    load_native_vision_lib = None
+
+_AprilTagDetection = localization.apriltag_solution.Detection
+_IS_LINUX = platform.system() == "Linux"
 
 logger = Logger("VisionManager")
 
@@ -205,6 +213,16 @@ class CameraPipeline:
         self._recording_path: Optional[str] = None
         self._recording_pending = False
         self._last_capture_message = ""
+        self._process_frame = None
+        self._replay_jpegs = camera_config.get("_replay_jpegs")
+        self._native_worker = None
+        self._native_async_vpu = bool(camera_config.get("napa_async_vpu", False))
+        self._native_cal_gen = -1
+        self._native_pose_sig = None
+        self._native_valid_sig = None
+        self._native_pose_enabled = False
+        self._native_reopen_at = 0.0
+        self._pipeline_core_affinity: Optional[Set[int]] = None
 
         prev_cpus = None
         if _BIG_CPUS and platform.system() == "Linux" and hasattr(os, "sched_getaffinity"):
@@ -252,8 +270,119 @@ class CameraPipeline:
                 except OSError:
                     pass
 
+    def _can_use_native_worker(self) -> bool:
+        if (
+            self.pipeline_type != "apriltag"
+            or not _IS_LINUX
+            or NativeVisionWorker is None
+            or load_native_vision_lib is None
+        ):
+            return False
+        if not self._replay_jpegs and not os.path.exists("/dev/mpp_service"):
+            return False
+        sec_cfg = localization.detection.ConfigCategory(self._apriltag_section)
+        min_px = sec_cfg.getIntConfig("napa_min_tag_px", 0).valueInt()
+        if min_px <= 0:
+            return False
+        return load_native_vision_lib() is not None
+
+    def _sync_native_state(self, worker) -> None:
+        w, h = worker.width, worker.height
+        cal_gen = localization.undistort._cal_generation
+        if cal_gen != self._native_cal_gen:
+            cal = localization.undistort.get_calibration_silent(self.camera_id, w, h)
+            self._native_pose_enabled = worker.update_lens(cal)
+            self._native_cal_gen = cal_gen
+
+        params = localization.apriltag_solution.CAM_PARAMS.get(self.camera_id)
+        if params is not None:
+            sig = (
+                params["CAM_MOUNT_H_deg"].valueFloat(),
+                params["CAM_MOUNT_V_deg"].valueFloat(),
+                params["CAM_MOUNT_ROLL_deg"].valueFloat(),
+                params["TAG_H_in"].valueFloat(),
+            )
+            if sig != self._native_pose_sig:
+                worker.update_pose_cfg(*sig)
+                self._native_pose_sig = sig
+
+        vids = localization.apriltag_solution.valid_tag_ids
+        if vids is not self._native_valid_sig:
+            worker.set_valid_ids(vids)
+            self._native_valid_sig = vids
+
+    def _open_native_worker(self) -> bool:
+        if self._native_worker is not None:
+            return True
+        now_m = time.monotonic()
+        if now_m < self._native_reopen_at:
+            return False
+        cfg = localization.detection._resolve_napa_settings(self._apriltag_section)
+        if cfg["min_tag_px"] <= 0:
+            return False
+        w, h = self.cam.get_resolution()
+        big_cpus = self._pipeline_core_affinity or _BIG_CPUS
+        worker = NativeVisionWorker(
+            dev_path=None if self._replay_jpegs else self.cam.camera_path,
+            width=w,
+            height=h,
+            fps=120,
+            buffersize=getattr(self.cam, "_buffersize", 2),
+            napa_cfg=cfg,
+            big_cpus=big_cpus,
+            little_cpus=_LITTLE_CPUS,
+            nice_level=-10,
+            async_vpu=bool(cfg.get("async_vpu", self._native_async_vpu)),
+            replay_jpegs=self._replay_jpegs,
+        )
+        if not worker.available:
+            worker.close()
+            self._native_reopen_at = now_m + 0.5
+            self.cam.fail_count += 1
+            if self.cam.fail_count % 20 == 1:
+                logger.Warn(f"Camera {self.camera_id}: native worker failed to open, retrying")
+            return False
+
+        self._native_cal_gen = -1
+        self._native_pose_sig = None
+        self._native_valid_sig = None
+        self._sync_native_state(worker)
+        if not worker.start():
+            worker.close()
+            self._native_reopen_at = now_m + 0.5
+            return False
+
+        with self.cam._lock:
+            self.cam._v4l2_mpp = worker
+            self.cam._locked_by_native = True
+            self.cam._opened = True
+            self.cam._is_open_flag = True
+            self.cam.fail_count = 0
+            self.cam._apply_exposure_locked()
+        self._frame_resolution = (worker.width, worker.height)
+        self._native_worker = worker
+        self._apriltag_initialized = True
+        logger.Log(
+            f"Camera {self.camera_id}: Native C pipeline active ({worker.width}x{worker.height}, "
+            f"t={cfg['threads']}, sh={cfg['shadow_min_tag_px']}, async_vpu={int(self._native_async_vpu)})"
+        )
+        return True
+
+    def _close_native_worker(self) -> None:
+        worker = self._native_worker
+        self._native_worker = None
+        if worker is not None:
+            with self.cam._lock:
+                if getattr(self.cam, "_v4l2_mpp", None) is worker:
+                    self.cam._v4l2_mpp = None
+                    self.cam._is_open_flag = False
+            worker.close()
+
     def _ensure_apriltag_ready(self) -> None:
         if self._apriltag_initialized or self.pipeline_type != "apriltag":
+            return
+        if self._can_use_native_worker():
+            self._apriltag_initialized = True
             return
         with self.lock:
             if self._apriltag_initialized or self.pipeline_type != "apriltag":
@@ -269,6 +398,126 @@ class CameraPipeline:
             )
             self._apriltag_initialized = True
 
+    def _publish_processed_frame(
+        self,
+        cam_frame,
+        display_frame,
+        frame_res: Tuple[int, int],
+        jpeg,
+        tags,
+        detections: List,
+        gain_frame,
+        gain_corners,
+        read_ns: int,
+        capture_ns: int,
+    ) -> None:
+        done_ns = monotonic_ns()
+        processing_latency = (done_ns - read_ns) / 1e9
+        capture_latency = (done_ns - capture_ns) / 1e9
+
+        if self.pipeline_type == "apriltag":
+            self.ntables.updateFrameNum(self.frame_num)
+        self.ntables.execute(detections, processing_latency, capture_ns)
+        self.cam.update_auto_gain(gain_frame, gain_corners)
+        self._maybe_publish_health()
+
+        now_m = time.monotonic()
+        with self.lock:
+            if self._recording_pending and self._writer is None:
+                self._start_writer_locked(cam_frame, jpeg is not None)
+            if self._writer is not None:
+                data = jpeg if self._writer_raw else cam_frame
+                if data is not None:
+                    self._writer.write(data)
+                    self._record_frames += 1
+            self.frame = display_frame
+            self._tags = tags
+            self._frame_seq += 1
+            self._frame_resolution = frame_res
+            self.detections = detections
+            self.processing_latency = processing_latency
+            self.capture_latency = capture_latency
+            self._last_processed_at = now_m
+
+        self.frame_count += 1
+        self._rate_count += 1
+        self.fps_log_count += 1
+
+        rate_elapsed = now_m - self.start_time
+        if self._rate_count >= 30 or (self._rate_count >= 5 and rate_elapsed >= 0.5):
+            if rate_elapsed > 0:
+                self.framerate = self._rate_count / rate_elapsed
+            self.start_time = now_m
+            self._rate_count = 0
+
+        log_elapsed = now_m - self.fps_log_time
+        if self.fps_log_count >= 100 or (self.fps_log_count >= 10 and log_elapsed >= 2.0):
+            if log_elapsed > 0:
+                self.backend_fps = self.fps_log_count / log_elapsed
+                logger.Log(
+                    f"Camera {self.camera_id} ({self.pipeline_type}): {self.backend_fps:.2f} FPS | "
+                    f"Latency: {processing_latency*1000:.2f}ms (since capture {capture_latency*1000:.2f}ms) | "
+                    f"Detections: {len(detections)}"
+                )
+            self.fps_log_time = now_m
+            self.fps_log_count = 0
+
+    def _process_frame_native(self) -> bool:
+        if self._native_worker is None and not self._can_use_native_worker():
+            return False
+        if self._native_worker is not None and not getattr(self.cam, "_opened", True):
+            self._close_native_worker()
+        if self._native_worker is None and not self._open_native_worker():
+            self._maybe_publish_health()
+            time.sleep(0.1)
+            return True
+
+        worker = self._native_worker
+        self._sync_native_state(worker)
+        want_jpeg = self._writer is not None or self._recording_pending
+        item = worker.wait_result(timeout_ms=500, want_jpeg=want_jpeg)
+        if item is None:
+            self.cam.fail_count += 1
+            if self.cam.fail_count % 20 == 0:
+                logger.Warn(f"Camera {self.camera_id}: native read failed ({self.cam.fail_count}x)")
+            if self.cam.fail_count >= self.cam.MAX_READ_RETRIES:
+                logger.Warn(f"Camera {self.camera_id}: native stream stalled, reopening...")
+                self._close_native_worker()
+            self._maybe_publish_health()
+            return True
+
+        frame, capture_ns, read_ns, _done_ns, corners, ids, poses, jpeg = item
+        self.cam.fail_count = 0
+        self.cam._last_frame = frame
+        self.cam._last_frame_at = time.monotonic()
+
+        frame_res = (int(frame.shape[1]), int(frame.shape[0]))
+        self.frame_num = (self.frame_num + 1) % 500
+
+        if self.focus_mode:
+            focus_score = cv2.Laplacian(frame, cv2.CV_64F).var()
+            with self.lock:
+                self.focus_score = focus_score
+                self.frame = frame
+                self._tags = None
+                self._frame_seq += 1
+                self._frame_resolution = frame_res
+            time.sleep(0.03)
+            return True
+
+        tags = (corners, ids)
+        if self._native_pose_enabled:
+            detections = [_AprilTagDetection(r_in, th_deg, tid) for r_in, th_deg, tid in poses]
+        else:
+            detections = localization.apriltag_solution.CALCULATE_PARTIAL_SOLUTION(
+                self.camera_id, frame, corners, ids
+            )
+        gain_corners = corners if (ids is not None) else None
+        self._publish_processed_frame(
+            frame, frame, frame_res, jpeg, tags, detections, frame, gain_corners, read_ns, capture_ns
+        )
+        return True
+
     def process_frame(self):
         if not self.running:
             return
@@ -278,6 +527,8 @@ class CameraPipeline:
 
         try:
             if not self.running:
+                return
+            if self._process_frame_native():
                 return
             if not self._apriltag_initialized:
                 self._ensure_apriltag_ready()
@@ -295,14 +546,10 @@ class CameraPipeline:
                 return
 
             frame_res = (int(frame.shape[1]), int(frame.shape[0]))
-            self.frame_num += 1
-            self.frame_num %= 500
+            self.frame_num = (self.frame_num + 1) % 500
 
             if self.focus_mode:
-                if len(frame.shape) == 3:
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                else:
-                    gray = frame
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
                 focus_score = cv2.Laplacian(gray, cv2.CV_64F).var()
                 with self.lock:
                     self.focus_score = focus_score
@@ -323,70 +570,28 @@ class CameraPipeline:
                     else:
                         corners, ids = self._apriltag(raw_gray)
                 else:
-                    frame = PROCESS_FRAME(raw_gray)
+                    if getattr(self, "_process_frame", None) is None:
+                        from camera.preprocess import PROCESS_FRAME
+                        self._process_frame = PROCESS_FRAME
+                    frame = self._process_frame(raw_gray)
                     corners, ids = localization.detection.DETECT_TAGS(frame, refine_image=raw_gray)
                 display_frame = frame
                 tags = (corners, ids)
                 detections = localization.apriltag_solution.CALCULATE_PARTIAL_SOLUTION(
                     self.camera_id, raw_gray, corners, ids
                 )
+                gain_frame = raw_gray
+                gain_corners = corners if ids is not None else None
             else:
                 display_frame, rawDets = self._visiony.runPipeline(frame)
                 detections = self._gamepiece_solution.CALCULATE_PARTIAL_SOLUTION(self.camera_id, frame, rawDets)
+                gain_frame = frame
+                gain_corners = None
 
-            done_ns = monotonic_ns()
-            processing_latency = (done_ns - read_ns) / 1e9
-            capture_latency = (done_ns - capture_ns) / 1e9
-
-            if self.pipeline_type == "apriltag":
-                self.ntables.updateFrameNum(self.frame_num)
-            self.ntables.execute(detections, processing_latency, capture_ns)
-
-            gain_frame = raw_gray if self.pipeline_type == "apriltag" else frame
-            gain_corners = corners if (self.pipeline_type == "apriltag" and ids is not None) else None
-            self.cam.update_auto_gain(gain_frame, gain_corners)
-            self._maybe_publish_health()
-
-            now_m = time.monotonic()
-            with self.lock:
-                if self._recording_pending and self._writer is None:
-                    self._start_writer_locked(cam_frame, jpeg is not None)
-                if self._writer is not None:
-                    data = jpeg if self._writer_raw else cam_frame
-                    if data is not None:
-                        self._writer.write(data)
-                        self._record_frames += 1
-                self.frame = display_frame
-                self._tags = tags
-                self._frame_seq += 1
-                self._frame_resolution = frame_res
-                self.detections = detections
-                self.processing_latency = processing_latency
-                self.capture_latency = capture_latency
-                self._last_processed_at = now_m
-
-            self.frame_count += 1
-            self._rate_count += 1
-            self.fps_log_count += 1
-
-            rate_elapsed = now_m - self.start_time
-            if self._rate_count >= 30 or (self._rate_count >= 5 and rate_elapsed >= 0.5):
-                if rate_elapsed > 0:
-                    self.framerate = self._rate_count / rate_elapsed
-                self.start_time = now_m
-                self._rate_count = 0
-
-            log_elapsed = now_m - self.fps_log_time
-            if self.fps_log_count >= 100 or (self.fps_log_count >= 10 and log_elapsed >= 2.0):
-                if log_elapsed > 0:
-                    self.backend_fps = self.fps_log_count / log_elapsed
-                    logger.Log(
-                        f"Camera {self.camera_id} ({self.pipeline_type}): {self.backend_fps:.2f} FPS | "
-                        f"Latency: {processing_latency*1000:.2f}ms (since capture {capture_latency*1000:.2f}ms) | "
-                        f"Detections: {len(detections)}"
-                    )
-                self.fps_log_time = now_m
-                self.fps_log_count = 0
+            self._publish_processed_frame(
+                cam_frame, display_frame, frame_res, jpeg, tags, detections,
+                gain_frame, gain_corners, read_ns, capture_ns
+            )
 
         except Exception as e:
             logger.Warn(f"Error in camera {self.camera_id}: {e}")
@@ -602,26 +807,28 @@ class CameraPipeline:
     def get_preview_jpeg(self, quality: int, max_width: int):
         quality = max(1, min(100, int(quality)))
         max_width = max(1, int(max_width))
-        with self.lock:
-            frame, tags, seq = self.frame, self._tags, self._frame_seq
+        with self._preview_lock:
+            if self._preview_seq == self._frame_seq:
+                cached = self._preview_cache.get((quality, max_width))
+                if cached is not None:
+                    return self._preview_frame, cached
+
+        for _ in range(2):
+            with self.lock:
+                frame, tags, seq = self.frame, self._tags, self._frame_seq
             if frame is None:
                 return None, None
-            with self._preview_lock:
-                if self._preview_seq == seq:
-                    cached = self._preview_cache.get((quality, max_width))
-                    if cached is not None:
-                        return self._preview_frame, cached
-            # Copy inside self.lock only on a preview cache miss (<= STREAM_MAX_FPS)
-            # so ring-buffered decoder frames cannot tear while resizing/encoding.
-            frame_copy = frame.copy()
-
-        scale = min(1.0, max_width / frame_copy.shape[1])
-        if scale < 1.0:
-            dst_w = max(1, int(round(frame_copy.shape[1] * scale)))
-            dst_h = max(1, int(round(frame_copy.shape[0] * scale)))
-            small = cv2.resize(frame_copy, (dst_w, dst_h), interpolation=cv2.INTER_LINEAR)
-        else:
-            small = frame_copy
+            # Downscale directly outside self.lock; 4/8-slot ring prevents tearing without a full-res copy.
+            src_w = frame.shape[1]
+            scale = min(1.0, max_width / src_w)
+            if scale < 1.0:
+                dst_w = max(1, int(round(src_w * scale)))
+                dst_h = max(1, int(round(frame.shape[0] * scale)))
+                small = cv2.resize(frame, (dst_w, dst_h), interpolation=cv2.INTER_LINEAR)
+            else:
+                small = frame.copy()
+            if (self._frame_seq - seq) < 3:
+                break
 
         if tags is not None:
             corners, ids = tags
@@ -638,7 +845,7 @@ class CameraPipeline:
             if self._preview_seq != seq:
                 self._preview_cache.clear()
                 self._preview_seq = seq
-                self._preview_frame = frame_copy
+                self._preview_frame = small
             self._preview_cache[(quality, max_width)] = jpeg
             token_frame = self._preview_frame
         return token_frame, jpeg
@@ -716,6 +923,7 @@ class CameraPipeline:
         self.running = False
         self._enabled_event.set()
         try:
+            self._close_native_worker()
             with self.lock:
                 if self._writer is not None:
                     self._writer.release()
@@ -772,6 +980,7 @@ class VisionManager:
             thread.join(timeout=1.0)
 
     def _run_pipeline(self, cam_pipeline: CameraPipeline, core_affinity: Optional[Set[int]] = None):
+        cam_pipeline._pipeline_core_affinity = core_affinity
         if core_affinity is not None:
             _pin_current_thread(core_affinity)
         else:

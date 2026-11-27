@@ -18,6 +18,8 @@ except ImportError:
     V4L2MppCamera = None
 
 logger = Logger("Camera")
+_IS_LINUX = platform.system() == "Linux"
+_IS_WIN_OR_MAC = platform.system() in ("Windows", "Darwin")
 
 # v4l2 auto_exposure menu values and standard UVC control IDs
 V4L2_EXPOSURE_MANUAL = 1
@@ -120,6 +122,7 @@ class CameraReader:
         self.cap: Optional[cv2.VideoCapture] = None
         self.fail_count = 0
         self._opened = False
+        self._is_open_flag = False
         self._reapply_exposure = False
 
         self._lock = Lock()
@@ -128,6 +131,8 @@ class CameraReader:
         self.last_jpeg: Optional[MatLike] = None
         self._v4l2_mpp = None
         self._mjpeg_decoder = None
+
+        self._locked_by_native = False
 
     def _is_open_locked(self) -> bool:
         v4l2_cam = getattr(self, "_v4l2_mpp", None)
@@ -183,6 +188,7 @@ class CameraReader:
         logger.Log("Opening camera...")
 
         had_open = (getattr(self, "_v4l2_mpp", None) is not None) or (self.cap is not None)
+        self._is_open_flag = False
         if getattr(self, "_v4l2_mpp", None) is not None:
             try:
                 self._v4l2_mpp.close()
@@ -209,6 +215,7 @@ class CameraReader:
                 )
                 if v4l2_cam.available:
                     self._v4l2_mpp = v4l2_cam
+                    self._is_open_flag = True
                     self._apply_exposure_locked()
                     self._reapply_exposure = True
                     self.fail_count = 0
@@ -229,8 +236,10 @@ class CameraReader:
             self.cap = cv2.VideoCapture(self.camera_path, cv2.CAP_V4L2)
 
         if not self.cap.isOpened():
+            self._is_open_flag = False
             logger.Warn("Failed to open camera")
             return
+        self._is_open_flag = True
 
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, buffersize)
@@ -330,13 +339,13 @@ class CameraReader:
             return
         self._frames_since_gain = 0
         white = tag_white(self._tag_frame, self._tag_corners) if self._frames_since_tags <= AUTO_GAIN_EVERY else None
+        if self._gain_locked and white is None:
+            return
         if white is not None:
             measured, target, source = white, self._tag_white_target.valueInt(), "tag white"
         else:
             measured, target, source = float(frame[::8, ::8].mean()), self._gain_target.valueInt(), "frame average"
         if self._gain_locked:
-            if white is None:
-                return
             low, high = AUTO_GAIN_WINDOW[0] * target, min(AUTO_GAIN_WINDOW[1] * target, TAG_WHITE_CLIPPED)
             self._gain_outside = 0 if low <= measured < high else self._gain_outside + 1
             if self._gain_outside < AUTO_GAIN_RETUNE_STEPS:
@@ -389,12 +398,19 @@ class CameraReader:
             self._tag_frame, self._tag_corners, self._frames_since_tags = frame, corners, 0
 
     def update_auto_gain(self, frame: Optional[MatLike], corners=None) -> None:
-        if frame is None or platform.system() != "Linux":
+        if frame is None or not _IS_LINUX:
             return
         if not self._auto_gain.valueInt():
             return
+        if not (self._opened and getattr(self, "_is_open_flag", True)):
+            return
+        if (corners is None or len(corners) == 0) and (self._frames_since_gain + 1 < AUTO_GAIN_EVERY):
+            self._frames_since_tags += 1
+            self._frames_since_gain += 1
+            return
         with self._lock:
             if not self._is_open_locked():
+                self._is_open_flag = False
                 return
             if corners is not None and len(corners) > 0:
                 self._tag_frame, self._tag_corners, self._frames_since_tags = frame, corners, 0
@@ -435,8 +451,7 @@ class CameraReader:
         }
 
     def is_open(self) -> bool:
-        with self._lock:
-            return self._opened and self._is_open_locked()
+        return bool(self._opened and getattr(self, "_is_open_flag", False))
 
     def get_resolution(self) -> Tuple[int, int]:
         return self._width.valueInt(), self._height.valueInt()
@@ -445,6 +460,10 @@ class CameraReader:
         self._width.setInt(width)
         self._height.setInt(height)
         with self._lock:
+            if getattr(self, "_locked_by_native", False):
+                self._opened = False
+                self._is_open_flag = False
+                return
             if self._opened:
                 self._open_camera_locked()
 
@@ -464,11 +483,12 @@ class CameraReader:
                 self._open_camera_locked()
                 self._opened = True
             if not self._is_open_locked():
+                self._is_open_flag = False
                 logger.Warn("Camera not open, reopening...")
                 self._open_camera_locked()
                 return None, monotonic_ns()
 
-            v4l2_cam = getattr(self, "_v4l2_mpp", None)
+            v4l2_cam = self._v4l2_mpp
             if v4l2_cam is not None:
                 frame, captured, jpeg = v4l2_cam.grab_gray(timeout_ms=500, want_jpeg=want_jpeg)
                 self.last_jpeg = jpeg if want_jpeg else None
@@ -491,7 +511,7 @@ class CameraReader:
                 if self._reapply_exposure:
                     self._reapply_exposure = False
                     self._apply_exposure_locked()
-                if not defer_auto_gain and platform.system() == "Linux":
+                if not defer_auto_gain and _IS_LINUX:
                     self._auto_gain_locked(frame)
                 return frame, captured
 
@@ -540,6 +560,7 @@ class CameraReader:
                     pass
                 self._mjpeg_decoder = None
             self._opened = False
+            self._is_open_flag = False
             self._last_frame = None
             self.last_jpeg = None
 

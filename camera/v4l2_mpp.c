@@ -60,6 +60,8 @@ typedef struct {
     MppBufferGroup pkt_grp;
     MppBuffer frm_buf;
     MppBuffer pkt_buf;
+    void *pkt_ptr;
+    MppPacket packet;
     MppFrame frame;
     size_t max_pkt_size;
     size_t max_frm_size;
@@ -90,6 +92,10 @@ static void mpp_cleanup(V4L2MppCam *cam) {
     if (!cam) return;
     if (cam->mpi && cam->ctx)
         cam->mpi->reset(cam->ctx);
+    if (cam->packet) {
+        mpp_packet_deinit(&cam->packet);
+        cam->packet = NULL;
+    }
     if (cam->frame) {
         mpp_frame_deinit(&cam->frame);
         cam->frame = NULL;
@@ -133,17 +139,24 @@ static int mpp_setup(V4L2MppCam *cam, int max_w, int max_h, int cachable) {
     if (cam->max_pkt_size < (2u << 20))
         cam->max_pkt_size = (2u << 20);
 
-    RK_U32 buf_type = MPP_BUFFER_TYPE_DMA_HEAP;
+    RK_U32 frm_type = MPP_BUFFER_TYPE_DMA_HEAP;
     if (cam->cachable)
-        buf_type |= MPP_BUFFER_FLAGS_CACHABLE;
+        frm_type |= MPP_BUFFER_FLAGS_CACHABLE;
+    /* Packet DMA buffer is sequential CPU write-only: uncachable WC avoids 2 sync ioctls/frame. */
+    RK_U32 pkt_type = MPP_BUFFER_TYPE_DMA_HEAP;
 
-    if (mpp_buffer_group_get_internal(&cam->frm_grp, buf_type) != MPP_OK || !cam->frm_grp)
+    if (mpp_buffer_group_get_internal(&cam->frm_grp, frm_type) != MPP_OK || !cam->frm_grp)
         goto fail;
-    if (mpp_buffer_group_get_internal(&cam->pkt_grp, buf_type) != MPP_OK || !cam->pkt_grp)
+    if (mpp_buffer_group_get_internal(&cam->pkt_grp, pkt_type) != MPP_OK || !cam->pkt_grp)
         goto fail;
     if (mpp_buffer_get(cam->frm_grp, &cam->frm_buf, cam->max_frm_size) != MPP_OK || !cam->frm_buf)
         goto fail;
     if (mpp_buffer_get(cam->pkt_grp, &cam->pkt_buf, cam->max_pkt_size) != MPP_OK || !cam->pkt_buf)
+        goto fail;
+    cam->pkt_ptr = mpp_buffer_get_ptr(cam->pkt_buf);
+    if (!cam->pkt_ptr)
+        goto fail;
+    if (mpp_packet_init_with_buffer(&cam->packet, cam->pkt_buf) != MPP_OK || !cam->packet)
         goto fail;
 
     if (mpp_frame_init(&cam->frame) != MPP_OK || !cam->frame)
@@ -322,14 +335,10 @@ int v4l2_mpp_get_ctrl(V4L2MppCam *cam, uint32_t ctrl_id, int *out_value) {
 static int decode_pkt_to_gray(
     V4L2MppCam *cam, size_t len, uint8_t *out_y, int out_cap, int *out_w, int *out_h
 ) {
-    void *pkt_ptr = mpp_buffer_get_ptr(cam->pkt_buf);
-    if (!pkt_ptr)
+    void *pkt_ptr = cam->pkt_ptr;
+    MppPacket packet = cam->packet;
+    if (!pkt_ptr || !packet)
         return -11;
-
-    MppPacket packet = NULL;
-    MPP_RET ret = mpp_packet_init_with_buffer(&packet, cam->pkt_buf);
-    if (ret != MPP_OK || !packet)
-        return -12;
 
     mpp_packet_set_data(packet, pkt_ptr);
     mpp_packet_set_size(packet, cam->max_pkt_size);
@@ -340,15 +349,12 @@ static int decode_pkt_to_gray(
     if (meta)
         mpp_meta_set_frame(meta, KEY_OUTPUT_FRAME, cam->frame);
 
-    ret = cam->mpi->decode_put_packet(cam->ctx, packet);
-    if (ret != MPP_OK) {
-        mpp_packet_deinit(&packet);
+    MPP_RET ret = cam->mpi->decode_put_packet(cam->ctx, packet);
+    if (ret != MPP_OK)
         return -13;
-    }
 
     MppFrame frame_ret = NULL;
     ret = cam->mpi->decode_get_frame(cam->ctx, &frame_ret);
-    mpp_packet_deinit(&packet);
 
     if (ret != MPP_OK || !frame_ret) {
         if (frame_ret && frame_ret != cam->frame)
@@ -378,10 +384,8 @@ static int decode_pkt_to_gray(
     if (!y_ptr || w <= 0 || h <= 0 || stride < w)
         return -17;
 
+    /* mpp_get_frame() already called mpp_buffer_sync_ro_begin(out_buf). */
     size_t y_bytes = (size_t)stride * (size_t)h;
-    if (cam->cachable && y_bytes > 0)
-        mpp_buffer_sync_ro_partial_begin(out_buf, 0, (RK_U32)y_bytes);
-
     if (!out_y || out_cap < w * h) {
         if (cam->cachable && y_bytes > 0)
             mpp_buffer_sync_ro_partial_end(out_buf, 0, (RK_U32)y_bytes);
@@ -500,17 +504,13 @@ int v4l2_mpp_grab_gray(
         return -6;
     }
 
-    void *pkt_ptr = mpp_buffer_get_ptr(cam->pkt_buf);
+    void *pkt_ptr = cam->pkt_ptr;
     if (!pkt_ptr) {
         xioctl(cam->fd, VIDIOC_QBUF, &vb);
         return -7;
     }
 
-    if (cam->cachable)
-        mpp_buffer_sync_partial_begin(cam->pkt_buf, 0, (RK_U32)jlen);
     memcpy(pkt_ptr, src, jlen);
-    if (cam->cachable)
-        mpp_buffer_sync_partial_end(cam->pkt_buf, 0, (RK_U32)jlen);
 
     if (opt_jpeg_out && opt_jpeg_cap >= (int)jlen) {
         memcpy(opt_jpeg_out, src, jlen);

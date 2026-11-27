@@ -16,7 +16,7 @@ _FALLBACK_MPP_LIB_PATH = "/home/orangepi/opi5plus_bench/libmpp_mjpeg.so"
 DEFAULT_V4L2_MPP_LIB_PATH = "/usr/local/lib/libv4l2_mpp.so"
 _FALLBACK_V4L2_MPP_LIB_PATH = "/home/orangepi/MonkeySee/camera/libv4l2_mpp.so"
 _MPP_DEVICE_PATH = "/dev/mpp_service"
-_RING_SLOTS = 3
+_RING_SLOTS = 4
 
 _lib_cache_lock = threading.Lock()
 _lib_cache: Dict[str, Optional[ctypes.CDLL]] = {}
@@ -104,11 +104,14 @@ def _load_c_lib(
     return loaded
 
 
-def _alloc_ring(w: int, h: int) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-    # Pre-touch pages at init and keep 3 ring slots so 120 FPS decode never tears a frame in use.
+def _alloc_ring(w: int, h: int) -> Tuple[List[np.ndarray], List[np.ndarray], List[Tuple[int, int]]]:
+    # Pre-touch pages at init and keep 4 ring slots (25 ms tear-free window at 120 FPS)
+    # so MJPEG preview copies can happen safely outside the camera pipeline lock.
     cap = max(1, w * h)
     ring = [np.zeros(cap, dtype=np.uint8) for _ in range(_RING_SLOTS)]
-    return ring, [buf.reshape(h, w) for buf in ring]
+    ring_2d = [buf.reshape(h, w) for buf in ring]
+    ring_ptrs = [(int(buf.ctypes.data), int(buf.nbytes)) for buf in ring]
+    return ring, ring_2d, ring_ptrs
 
 
 def _as_uint8_view(raw) -> Tuple[np.ndarray, object]:
@@ -155,7 +158,7 @@ def _jpeg_dimensions(arr: np.ndarray) -> Optional[Tuple[int, int]]:
 
 
 class MppMjpegDecoder:
-    """Rockchip MPP hardware MJPEG-to-grayscale decoder with 3-slot ring buffer and OpenCV fallback."""
+    """Rockchip MPP hardware MJPEG-to-grayscale decoder with 4-slot ring buffer and OpenCV fallback."""
 
     def __init__(self, max_w: int = 1280, max_h: int = 800, cachable: Union[bool, int] = True, lib_path: Optional[str] = None):
         self._max_w = int(max_w)
@@ -170,8 +173,12 @@ class MppMjpegDecoder:
         self._dec: Optional[int] = None
         self._ring: List[np.ndarray] = []
         self._ring_2d: List[np.ndarray] = []
+        self._ring_ptrs: List[Tuple[int, int]] = []
         self._ring_idx = 0
         self._w_c, self._h_c, self._fmt_c = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+        self._w_ref = ctypes.byref(self._w_c)
+        self._h_ref = ctypes.byref(self._h_c)
+        self._fmt_ref = ctypes.byref(self._fmt_c)
 
         if self._lib is not None:
             self._dec = self._lib.mpp_mjpeg_create(self._max_w, self._max_h, self._cachable)
@@ -179,7 +186,7 @@ class MppMjpegDecoder:
                 logger.Warn("mpp_mjpeg_create failed; falling back to OpenCV imdecode")
                 self._dec = None
             else:
-                self._ring, self._ring_2d = _alloc_ring(self._max_w, self._max_h)
+                self._ring, self._ring_2d, self._ring_ptrs = _alloc_ring(self._max_w, self._max_h)
 
     @property
     def available(self) -> bool:
@@ -198,9 +205,9 @@ class MppMjpegDecoder:
         if not self._dec:
             logger.Warn(f"mpp_mjpeg_create({self._max_w}, {self._max_h}) failed; using OpenCV fallback")
             self._dec = None
-            self._ring, self._ring_2d = [], []
+            self._ring, self._ring_2d, self._ring_ptrs = [], [], []
             return False
-        self._ring, self._ring_2d = _alloc_ring(self._max_w, self._max_h)
+        self._ring, self._ring_2d, self._ring_ptrs = _alloc_ring(self._max_w, self._max_h)
         self._ring_idx = 0
         return True
 
@@ -220,14 +227,19 @@ class MppMjpegDecoder:
     ) -> Optional[np.ndarray]:
         use_out = out is not None and out.dtype == np.uint8 and out.flags["C_CONTIGUOUS"] and out.nbytes >= min_bytes
         idx = self._ring_idx
-        target = out if use_out else self._ring[idx]
+        if use_out:
+            target = out
+            target_ptr, target_cap = int(out.ctypes.data), int(out.nbytes)
+        else:
+            target = self._ring[idx]
+            target_ptr, target_cap = self._ring_ptrs[idx]
         rc = self._lib.mpp_mjpeg_decode_gray(
-            self._dec, arr.ctypes.data, nbytes, target.ctypes.data, int(target.nbytes),
-            ctypes.byref(self._w_c), ctypes.byref(self._h_c), ctypes.byref(self._fmt_c),
+            self._dec, arr.ctypes.data, nbytes, target_ptr, target_cap,
+            self._w_ref, self._h_ref, self._fmt_ref,
         )
         if rc == 0:
             w_out, h_out = self._w_c.value, self._h_c.value
-            if w_out > 0 and h_out > 0 and target.nbytes >= w_out * h_out:
+            if w_out > 0 and h_out > 0 and target_cap >= w_out * h_out:
                 if not use_out:
                     self._ring_idx = (idx + 1) % _RING_SLOTS
                     if w_out == self._max_w and h_out == self._max_h:
@@ -268,7 +280,7 @@ class MppMjpegDecoder:
             return
         with lock:
             dec, lib = getattr(self, "_dec", None), getattr(self, "_lib", None)
-            self._dec, self._ring, self._ring_2d = None, [], []
+            self._dec, self._ring, self._ring_2d, self._ring_ptrs = None, [], [], []
             if dec is not None and lib is not None:
                 try:
                     lib.mpp_mjpeg_destroy(dec)
@@ -298,7 +310,7 @@ def decode_mjpeg_gray(raw, decoder: Optional[MppMjpegDecoder] = None, out: Optio
 
 
 class V4L2MppCamera:
-    """Direct Linux V4L2 MMAP + Rockchip MPP MJPEG-to-grayscale capture with 3-slot ring buffer."""
+    """Direct Linux V4L2 MMAP + Rockchip MPP MJPEG-to-grayscale capture with 4-slot ring buffer."""
 
     def __init__(
         self, dev_path: str, width: int = 1280, height: int = 800, fps: int = 120,
@@ -315,10 +327,19 @@ class V4L2MppCamera:
         self._max_pkt = max(self.width * self.height * 2, 2 << 20)
         self._ring: List[np.ndarray] = []
         self._ring_2d: List[np.ndarray] = []
+        self._ring_ptrs: List[Tuple[int, int]] = []
         self._ring_idx = 0
         self._jpeg_buf: Optional[np.ndarray] = None
+        self._jpeg_ptr = 0
+        self._jpeg_cap = 0
         self._w_c, self._h_c, self._ts_c = ctypes.c_int(), ctypes.c_int(), ctypes.c_int64()
         self._jlen_c, self._drop_c, self._ctrl_c = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+        self._w_ref = ctypes.byref(self._w_c)
+        self._h_ref = ctypes.byref(self._h_c)
+        self._ts_ref = ctypes.byref(self._ts_c)
+        self._jlen_ref = ctypes.byref(self._jlen_c)
+        self._drop_ref = ctypes.byref(self._drop_c)
+        self._ctrl_ref = ctypes.byref(self._ctrl_c)
 
         if self._lib is not None and dev_path:
             handle = self._lib.v4l2_mpp_open(
@@ -335,7 +356,7 @@ class V4L2MppCamera:
                     self.fps = fps_c.value if fps_c.value > 0 else float(fps)
                     self.buffers = max(1, buf_c.value)
                     self._max_pkt = max(pkt_c.value, 2 << 20)
-                self._ring, self._ring_2d = _alloc_ring(self.width, self.height)
+                self._ring, self._ring_2d, self._ring_ptrs = _alloc_ring(self.width, self.height)
 
     @property
     def available(self) -> bool:
@@ -351,7 +372,7 @@ class V4L2MppCamera:
         with self._lock:
             if self._cam is None or self._lib is None:
                 return None
-            if self._lib.v4l2_mpp_get_ctrl(self._cam, int(ctrl_id), ctypes.byref(self._ctrl_c)) == 0:
+            if self._lib.v4l2_mpp_get_ctrl(self._cam, int(ctrl_id), self._ctrl_ref) == 0:
                 return int(self._ctrl_c.value)
             return None
 
@@ -361,29 +382,30 @@ class V4L2MppCamera:
                 return None, 0, None
 
             idx = self._ring_idx
-            target = self._ring[idx]
+            target_ptr, target_cap = self._ring_ptrs[idx]
             jpeg_ptr, jpeg_cap = 0, 0
             if want_jpeg:
                 if self._jpeg_buf is None or self._jpeg_buf.nbytes < self._max_pkt:
                     self._jpeg_buf = np.empty(self._max_pkt, dtype=np.uint8)
-                jpeg_ptr, jpeg_cap = int(self._jpeg_buf.ctypes.data), int(self._jpeg_buf.nbytes)
+                    self._jpeg_ptr, self._jpeg_cap = int(self._jpeg_buf.ctypes.data), int(self._jpeg_buf.nbytes)
+                jpeg_ptr, jpeg_cap = self._jpeg_ptr, self._jpeg_cap
 
             rc = self._lib.v4l2_mpp_grab_gray(
-                self._cam, int(timeout_ms), target.ctypes.data, int(target.nbytes),
-                ctypes.byref(self._w_c), ctypes.byref(self._h_c), ctypes.byref(self._ts_c),
-                jpeg_ptr, jpeg_cap, ctypes.byref(self._jlen_c), ctypes.byref(self._drop_c),
+                self._cam, int(timeout_ms), target_ptr, target_cap,
+                self._w_ref, self._h_ref, self._ts_ref,
+                jpeg_ptr, jpeg_cap, self._jlen_ref, self._drop_ref,
             )
 
             jpeg_arr: Optional[np.ndarray] = None
             jlen = int(self._jlen_c.value)
-            if want_jpeg and jlen > 0 and self._jpeg_buf is not None and jlen <= self._jpeg_buf.nbytes:
+            if want_jpeg and jlen > 0 and self._jpeg_buf is not None and jlen <= self._jpeg_cap:
                 jpeg_arr = self._jpeg_buf[:jlen].copy().reshape(1, -1)
 
             if rc == 0:
                 w_out, h_out = int(self._w_c.value), int(self._h_c.value)
-                if w_out > 0 and h_out > 0 and target.nbytes >= w_out * h_out:
+                if w_out > 0 and h_out > 0 and target_cap >= w_out * h_out:
                     self._ring_idx = (idx + 1) % _RING_SLOTS
-                    gray = self._ring_2d[idx] if (w_out == self.width and h_out == self.height) else target[: w_out * h_out].reshape(h_out, w_out)
+                    gray = self._ring_2d[idx] if (w_out == self.width and h_out == self.height) else self._ring[idx][: w_out * h_out].reshape(h_out, w_out)
                     return gray, int(self._ts_c.value), jpeg_arr
 
             if jpeg_arr is not None:
@@ -399,7 +421,7 @@ class V4L2MppCamera:
             return
         with lock:
             cam, lib = getattr(self, "_cam", None), getattr(self, "_lib", None)
-            self._cam, self._ring, self._ring_2d, self._jpeg_buf = None, [], [], None
+            self._cam, self._ring, self._ring_2d, self._ring_ptrs, self._jpeg_buf = None, [], [], [], None
             if cam is not None and lib is not None:
                 try:
                     lib.v4l2_mpp_close(cam)

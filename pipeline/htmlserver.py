@@ -13,6 +13,7 @@ from camera.camerareader import RESOLUTIONS
 from localization.undistort import has_opencv_calibration
 from calibration.charuco_calibrator import save_samples
 import os
+import sys
 
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
@@ -25,6 +26,37 @@ GAIN_SLIDER_MAX = 255
 
 STREAM_MAX_FPS = 15
 STREAM_MAX_WIDTH = 640
+
+
+_PREPROCESS_SLIDER_SPECS = {
+    "dfc-target": ("target_brightness", 155, True, "SET_TARGET_BRIGHTNESS"),
+    "aslc-bins": ("acc_num_bins", 1200, True, "SET_NUM_BINS"),
+    "aslc-min-corr": ("min_corr_strength", 0.1, False, "SET_MIN_CORR_STRENGTH"),
+    "divergence-gain": ("divergence_gain", 1.5, False, "SET_DIVERGENCE_GAIN"),
+}
+
+
+def _preprocess_cfg(slider_type: str):
+    key, default, is_int, _ = _PREPROCESS_SLIDER_SPECS[slider_type]
+    cat = ConfigCategory("Preprocessing")
+    return cat.getIntConfig(key, default) if is_int else cat.getFloatConfig(key, default)
+
+
+def _preprocess_setter(slider_type: str):
+    _, _, is_int, fn_name = _PREPROCESS_SLIDER_SPECS[slider_type]
+    cfg = _preprocess_cfg(slider_type)
+
+    def _set(value):
+        val = int(value) if is_int else float(value)
+        mod = sys.modules.get("camera.preprocess")
+        if mod is not None:
+            getattr(mod, fn_name)(val)
+        elif is_int:
+            cfg.setInt(val)
+        else:
+            cfg.setFloat(val)
+
+    return _set
 
 
 def dashboard_port(camera_id: int) -> int:
@@ -500,8 +532,11 @@ class DashboardServer:
         return f"No calibration at {width}x{height}: tags won't report distance until you calibrate on the Calibration tab"
 
     def create_apriltag_sliders(self, cam_id):
-        from camera.preprocess import GET_DIVERGENCE_GAIN, GET_TARGET_BRIGHTNESS, GET_NUM_BINS, GET_MIN_CORR_STRENGTH
         from localization.detection import GET_THRESH_STEP, GET_THRESH_WIN
+        target_brightness = _preprocess_cfg("dfc-target").valueInt()
+        num_bins = _preprocess_cfg("aslc-bins").valueInt()
+        min_corr = _preprocess_cfg("aslc-min-corr").valueFloat()
+        div_gain = _preprocess_cfg("divergence-gain").valueFloat()
         
         return html.Div([
             html.H4("Settings", style={
@@ -523,7 +558,7 @@ class DashboardServer:
                 min=50,
                 max=200,
                 step=1,
-                value=GET_TARGET_BRIGHTNESS(),
+                value=target_brightness,
                 marks={50: '50', 200: '200'},
                 tooltip={"placement": "bottom", "always_visible": True},
                 className="funky-slider"
@@ -540,7 +575,7 @@ class DashboardServer:
                 min=100,
                 max=1600,
                 step=100,
-                value=GET_NUM_BINS(),
+                value=num_bins,
                 marks={100: '100', 1600: '1600'},
                 tooltip={"placement": "bottom", "always_visible": True},
                 className="funky-slider"
@@ -557,7 +592,7 @@ class DashboardServer:
                 min=0.02,
                 max=0.5,
                 step=0.01,
-                value=GET_MIN_CORR_STRENGTH(),
+                value=min_corr,
                 marks={0.02: '0.02', 0.5: '0.5'},
                 tooltip={"placement": "bottom", "always_visible": True},
                 className="funky-slider"
@@ -574,7 +609,7 @@ class DashboardServer:
                 min=0.5,
                 max=4.0,
                 step=0.1,
-                value=GET_DIVERGENCE_GAIN(),
+                value=div_gain,
                 marks={0.5: '0.5', 4.0: '4.0'},
                 tooltip={"placement": "bottom", "always_visible": True},
                 className="funky-slider"
@@ -1087,16 +1122,15 @@ class DashboardServer:
 
     def setup_slider_callbacks(self):
         from dash import no_update
-        from camera.preprocess import SET_DIVERGENCE_GAIN, SET_TARGET_BRIGHTNESS, SET_NUM_BINS, SET_MIN_CORR_STRENGTH
         from localization.detection import SET_THRESH_STEP, SET_THRESH_WIN
         from localization.visiony import CONF, ASPECT_THRESH
         from localization.gamepiece_solution import WD, ONT
 
         for slider_type, setter in (
-            ("dfc-target", SET_TARGET_BRIGHTNESS),
-            ("aslc-bins", SET_NUM_BINS),
-            ("aslc-min-corr", SET_MIN_CORR_STRENGTH),
-            ("divergence-gain", SET_DIVERGENCE_GAIN),
+            ("dfc-target", _preprocess_setter("dfc-target")),
+            ("aslc-bins", _preprocess_setter("aslc-bins")),
+            ("aslc-min-corr", _preprocess_setter("aslc-min-corr")),
+            ("divergence-gain", _preprocess_setter("divergence-gain")),
             ("thresh-step", SET_THRESH_STEP),
             ("max-thresh", SET_THRESH_WIN),
             ("framecomp", DashboardServer.framecomp_slider.setFloat),

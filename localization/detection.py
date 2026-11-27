@@ -10,7 +10,8 @@ import numpy as np
 from cv2.typing import MatLike
 
 import util.config as config_mod
-from localization.undistort import calibration_for, has_opencv_calibration
+import localization.undistort as _undistort_mod
+from localization.undistort import get_calibration_silent
 from util.config import ConfigCategory
 from util.logger import Logger
 
@@ -239,6 +240,9 @@ class NativeNapaDetector:
         self._lens_size: Optional[Tuple[int, int]] = None
         self._lens_k_ref = None
         self._lens_d_ref = None
+        self._cal_gen = -1
+        self._cal_mat_count = -1
+        self._gray_ptr_cache = []
 
         self._max_tags = max(1, int(max_tags))
         self._out_buf = (_NapaDetection * self._max_tags)()
@@ -263,17 +267,23 @@ class NativeNapaDetector:
             if camera_id != self._camera_id:
                 self._camera_id = camera_id
                 self._lens_size = self._lens_k_ref = self._lens_d_ref = None
+                self._cal_gen = -1
 
     def _sync_lens_locked(self, width: int, height: int) -> None:
         if not self._has_lens:
             return
-        cal = None
-        if self._apply_lens and self._camera_id is not None and has_opencv_calibration(self._camera_id, width, height):
-            cal = calibration_for(self._camera_id, width, height)
+        cal_gen = _undistort_mod._cal_generation
+        cal_count = len(_undistort_mod._camera_matrices)
+        if (width, height) == self._lens_size and cal_gen == self._cal_gen and cal_count == self._cal_mat_count:
+            return
+        cal = get_calibration_silent(self._camera_id, width, height) if (self._apply_lens and self._camera_id is not None) else None
+        cal_gen = _undistort_mod._cal_generation
+        cal_count = len(_undistort_mod._camera_matrices)
 
         if cal is not None:
             cam_mat, dist_coeffs = cal
             if (width, height) == self._lens_size and cam_mat is self._lens_k_ref and dist_coeffs is self._lens_d_ref:
+                self._cal_gen, self._cal_mat_count = cal_gen, cal_count
                 return
             intrinsics = (ctypes.c_double * 5)(
                 float(cam_mat[0, 0]), float(cam_mat[1, 1]), float(cam_mat[0, 2]), float(cam_mat[1, 2]), 0.0,
@@ -285,13 +295,17 @@ class NativeNapaDetector:
                 logger.Warn(f"Camera {self._camera_id}: napa_set_lens failed (rc={rc}), disabling lens model")
                 self._lib.napa_set_lens(self._det, _NAPA_LENS_NONE, None, None, 0)
             self._lens_size, self._lens_k_ref, self._lens_d_ref = (width, height), cam_mat, dist_coeffs
+            self._cal_gen, self._cal_mat_count = cal_gen, cal_count
             return
 
         if (width, height) != self._lens_size or self._lens_k_ref is not None:
             self._lib.napa_set_lens(self._det, _NAPA_LENS_NONE, None, None, 0)
             self._lens_size, self._lens_k_ref, self._lens_d_ref = (width, height), None, None
+        self._cal_gen, self._cal_mat_count = cal_gen, cal_count
 
     def _prepare_gray(self, image: MatLike) -> np.ndarray:
+        if image.ndim == 2 and image.dtype == np.uint8 and image.flags.c_contiguous:
+            return image
         if image.ndim == 3:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         if image.dtype != np.uint8 or image.strides[1] != 1 or image.strides[0] < image.shape[1]:
@@ -300,16 +314,33 @@ class NativeNapaDetector:
 
     def _run_detect_locked(self, gray: np.ndarray) -> int:
         h, w = gray.shape[:2]
-        stride = int(gray.strides[0])
+        ptr = 0
+        stride = 0
+        cache = self._gray_ptr_cache
+        for entry in cache:
+            if entry[0] is gray and entry[2] == w and entry[3] == h:
+                ptr, stride = entry[1], entry[4]
+                break
+        if ptr == 0:
+            stride = int(gray.strides[0])
+            ptr = gray.ctypes.data
+            cache.insert(0, (gray, ptr, w, h, stride))
+            if len(cache) > 4:
+                cache.pop()
         self._sync_lens_locked(w, h)
-        args = (self._det, gray.ctypes.data, w, h, stride, self._params_ref, self._out_buf, self._max_tags)
         if self._recover_shadows:
-            cnt = self._lib.napa_detect_shadows_configured(*args, self._shadow_min_tag_px)
+            cnt = self._lib.napa_detect_shadows_configured(
+                self._det, ptr, w, h, stride, self._params_ref, self._out_buf, self._max_tags, self._shadow_min_tag_px
+            )
             if cnt < 0:
                 logger.Warn(f"napa_detect_shadows_configured returned {cnt}, retrying without shadow pass")
-                cnt = self._lib.napa_detect(*args)
+                cnt = self._lib.napa_detect(
+                    self._det, ptr, w, h, stride, self._params_ref, self._out_buf, self._max_tags
+                )
         else:
-            cnt = self._lib.napa_detect(*args)
+            cnt = self._lib.napa_detect(
+                self._det, ptr, w, h, stride, self._params_ref, self._out_buf, self._max_tags
+            )
         if cnt < 0:
             logger.Warn(f"napa_detect failed with code {cnt}")
             return 0
@@ -327,8 +358,11 @@ class NativeNapaDetector:
             if cnt <= 0:
                 return [], None
             sub = self._rows_view[:cnt]
-            pts = sub["corners"][:, _REORDER_FLAT].reshape(cnt, 1, 4, 2)
-            return [pts[i] for i in range(cnt)], sub["id"].astype(np.int32, copy=True)
+            src = sub["corners"].reshape(cnt, 4, 2)
+            pts = np.empty((cnt, 1, 4, 2), dtype=np.float64)
+            pts[:, 0, :2, :] = src[:, 2:, :]
+            pts[:, 0, 2:, :] = src[:, :2, :]
+            return [pts[i] for i in range(cnt)], sub["id"].copy()
 
     def detect(self, image: MatLike):
         """Return list of tag objects matching napa_vision.NapaDetector.detect()."""
